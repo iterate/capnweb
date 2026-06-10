@@ -205,6 +205,10 @@ The following types can be passed over RPC (in arguments or return values), and 
 * `ReadableStream` and `WritableStream`, with automatic flow control.
 * `Headers`, `Request`, and `Response` from the Fetch API.
 
+Additionally, a `Response` carrying a WebSocket -- as produced by a `fetch()` that performs a
+WebSocket upgrade on Cloudflare Workers -- can be passed over RPC. See
+[Tunneling WebSockets](#tunneling-websockets).
+
 The following types are not supported as of this writing, but may be added in the future:
 * `Map` and `Set`
 * `ArrayBuffer` and typed arrays other than `Uint8Array`
@@ -309,6 +313,74 @@ Since all of the not-yet-determined values seen by the callback are represented 
 ### Streaming with flow control
 
 You may pass a `ReadableStream` or `WritableStream` over RPC. When doing so, the RPC system automatically creates an equivalent stream at the other end and pumps bytes (or arbitrarily-typed chunks) across. This is done in such a way as to ensure the available bandwidth is fully utilized while minimizing buffer bloat, by observing the bandwidth-delay product and applying backpressure when too much is written. Multiple streams can be sent across the same connection -- they will be multiplexed appropriately, similar to HTTP/2 stream multiplexing.
+
+### Tunneling WebSockets
+
+On Cloudflare Workers, a `fetch()` that performs a WebSocket upgrade returns a `Response` whose
+`webSocket` property holds one end of the socket. Cap'n Web can pass such a `Response` over RPC,
+tunneling the WebSocket's messages through the RPC session. This lets an RPC server open a
+WebSocket on the client's behalf -- for example, acting as a gateway to a backend the client
+can't reach directly:
+
+```ts
+// Server
+class Gateway extends RpcTarget {
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Expected a WebSocket upgrade.", { status: 426 });
+    }
+
+    // On Workers, any upgrade `fetch()` produces a suitable Response. On other platforms,
+    // attach an open WebSocket to a Response the same way the Workers runtime does:
+    //   Object.defineProperty(new Response(null), "webSocket", { value: socket })
+    return await fetch(request);
+  }
+}
+
+// Client
+let response = await stub.fetch(new Request("https://backend.example/chat", {
+  headers: { Upgrade: "websocket" },
+}));
+
+let socket = response.webSocket;
+socket.addEventListener("message", event => console.log(event.data));
+socket.send("hello");
+```
+
+The received socket behaves like an ordinary, already-open WebSocket. On Workers, it *is* a real
+`WebSocket` (and the `Response` has status 101), so the `Response` can even be returned from a
+`fetch` handler to complete a real HTTP upgrade. On other platforms, where no native upgrade
+socket type exists, it is a WebSocket-like object supporting `send()`, `close()`, `accept()`,
+`readyState`, and `message`/`close`/`error` events; in particular, it can be passed to
+`newWebSocketRpcSession()` to run a nested Cap'n Web session through the tunnel. (The test suite
+verifies this by running the same battery of session tests over a tunneled socket as over a
+direct WebSocket connection.)
+
+Some details to be aware of:
+
+* Close (or dispose) the socket when you are done with it, so the underlying connection can be
+  released.
+* If an upgrade `Response` arrives in your RPC method's parameters and you want to keep the
+  socket beyond the call, interact with it before returning -- most idiomatically by calling
+  `accept()`, just like a Workers WebSocket. A socket that nobody has touched is released when
+  the call ends (much like an unread `ReadableStream` is canceled), so the sender can close the
+  underlying connection.
+* Only a `Response`'s `webSocket` can be passed over RPC; bare `WebSocket` objects are not
+  serializable.
+* The socket being sent must support the standard `addEventListener()` API (browser WebSockets,
+  the `ws` package, and Workers WebSockets all do). Callback-based server sockets, like
+  `Bun.serve()`'s `ServerWebSocket`, would need an adapter.
+* Under the hood, the socket is represented as a pair of streams, so messages get the streams'
+  flow control, and the socket's messages start streaming to the receiver as soon as the
+  `Response` is serialized -- there is no round trip before messages flow. Note that ping/pong
+  control frames are not forwarded (standard WebSocket APIs don't expose them), and that
+  inbound flow control ends at the sender's socket: the WebSocket API offers no way to slow
+  down a peer, so a flooding peer buffers on the sending side.
+* Cap'n Web only begins listening to the socket when the `Response` is serialized. Workers
+  WebSockets buffer incoming messages until then, but on platforms whose sockets don't buffer
+  (e.g. Node with `ws`), messages that arrive before that point are dropped.
+
+The wire representation is described in [the protocol documentation](protocol.md).
 
 ### Cloudflare Workers RPC interoperability
 
