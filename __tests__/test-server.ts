@@ -57,7 +57,10 @@ export async function setup(project: TestProject) {
   //
   // Passing a host makes listen() take the async DNS-resolution path, so we must wait for the
   // "listening" event before address() is populated (with no host, binding is synchronous).
-  await new Promise<void>((resolve) => httpServer!.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    httpServer!.once("error", reject);
+    httpServer!.listen(0, "127.0.0.1", resolve);
+  });
   let addr = httpServer.address() as AddressInfo;
 
   // Provide the server address to tests.
