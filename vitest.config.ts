@@ -15,9 +15,14 @@ export default defineConfig({
       {
         test: {
           name: 'node',
-          // We throw flow-control test under Node only because it's testing straightforward
-          // JavaScript -- no need to run it on every runtime.
-          include: ['__tests__/index.test.ts', '__tests__/flow-control.test.ts'],
+          // We throw the flow-control and websocket-tunnel tests under Node only because they
+          // are testing straightforward JavaScript -- no need to run them on every runtime.
+          // (websocket-tunnel also has its own workerd coverage in workerd.test.ts.)
+          include: [
+            '__tests__/index.test.ts',
+            '__tests__/flow-control.test.ts',
+            '__tests__/websocket-tunnel.test.ts',
+          ],
           environment: 'node',
         },
       },

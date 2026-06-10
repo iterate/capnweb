@@ -240,6 +240,39 @@ interface WorkerdTestTarget extends TestTarget {
 }
 
 describe("workerd RPC server", () => {
+  it("can return a WebSocket upgrade Response over RPC", async () => {
+    class WebSocketResponseTarget extends RpcTarget {
+      openEcho() {
+        let pair = new WebSocketPair();
+        pair[1].accept();
+        pair[1].addEventListener("message", event => pair[1].send(event.data));
+        return new Response(null, { status: 101, webSocket: pair[0] });
+      }
+    }
+
+    let pair = new WebSocketPair();
+    pair[0].accept();
+    pair[1].accept();
+    let api: any = newWebSocketRpcSession(pair[0]);
+    newWebSocketRpcSession(pair[1], new WebSocketResponseTarget());
+
+    // On workerd, the received Response holds a native WebSocket, suitable for completing a real
+    // HTTP upgrade (e.g. by returning the Response from a fetch handler).
+    let response: Response = await api.openEcho();
+    expect(response.status).toBe(101);
+    let socket = response.webSocket;
+    expect(socket).toBeTruthy();
+
+    socket!.accept();
+    let message = new Promise(resolve => {
+      socket!.addEventListener("message", event => resolve(event.data), { once: true });
+    });
+    socket!.send("hello over Response.webSocket");
+
+    expect(await message).toBe("hello over Response.webSocket");
+    socket!.close();
+  });
+
   it("can accept WebSocket RPC connections", async () => {
     let resp = await (<Env>env).testServer.fetch("http://foo", {headers: {Upgrade: "websocket"}});
     let ws = resp.webSocket;
