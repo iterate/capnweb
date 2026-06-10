@@ -10,6 +10,7 @@ import { deserialize, serialize, RpcSession, type RpcSessionOptions, RpcTranspor
 import { swapByteOrder } from "../src/serialize.js"
 import { MAX_CLOSE_REASON_BYTES } from "../src/websocket.js"
 import { Counter, TestTarget } from "./test-util.js";
+import { registerSessionTestBattery } from "./session-battery.js";
 
 type CustomEncodingLevel = RpcTransportWithCustomEncoding["encodingLevel"];
 
@@ -2200,22 +2201,14 @@ describe("HTTP requests", () => {
 });
 
 describe("WebSockets", () => {
-  it("can open a WebSocket connection", async () => {
-    let url = `ws://${inject("testServerHost")}`;
-
-    let cap = newWebSocketRpcSession<TestTarget>(url);
-
-    expect(await cap.square(5)).toBe(25);
-
-    {
-      let counter = cap.makeCounter(2);
-      expect(await counter.increment(3)).toBe(5);
-    }
-
-    {
-      let counter = new Counter(4);
-      expect(await cap.incrementCounter(counter, 9)).toBe(13);
-    }
+  // Run the shared battery over a direct WebSocket connection. (The same battery runs over a
+  // *tunneled* WebSocket in websocket-tunnel.test.ts, proving the two transports equivalent.)
+  registerSessionTestBattery(async () => {
+    let stub = newWebSocketRpcSession<TestTarget>(`ws://${inject("testServerHost")}`);
+    return {
+      stub,
+      async [Symbol.asyncDispose]() { stub[Symbol.dispose](); },
+    };
   });
 });
 

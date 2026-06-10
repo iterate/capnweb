@@ -812,12 +812,46 @@ export class RpcPayload {
     private promises?: LocatedPromise[]
   ) {}
 
-  // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets
-  // or WritableStreams found in the payload at the time that it is serialized (or deep-copied) for
-  // return, so that we can make sure they are not disposed before the pipeline ends.
+  // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets,
+  // streams, or WebSockets found in the payload at the time that it is serialized (or deep-copied)
+  // for return, so that we can make sure they are not disposed before the pipeline ends.
   //
   // This is initialized on first use.
-  private rpcTargets?: Map<RpcTarget | Function | WritableStream | ReadableStream, StubHook>;
+  private rpcTargets?: Map<object, StubHook>;
+
+  // Common implementation of the getHookFor*() methods below, for `source === "return"` payloads.
+  // Looks up `key` in `rpcTargets`, calling `create()` to make the hook if there isn't one yet.
+  //
+  // If dupStubs is true, we want to both make sure the map contains the hook, and also return
+  // a dup of that hook.
+  //
+  // If dupStubs is false, then we are being called as part of ensureDeepCopied(), i.e. replacing
+  // ourselves with a deep copy. In this case we actually want the copy to end up owning all
+  // the hooks, and the map to be left empty. So what we do in this case is:
+  // * If the key is not in the map, we just create the hook, but don't populate the map.
+  // * If the key *is* in the map, we *remove* the hook from the map, and return it.
+  private getHookForReturn(key: object, dupStubs: boolean, create: () => StubHook): StubHook {
+    let hook = this.rpcTargets?.get(key);
+    if (hook) {
+      if (dupStubs) {
+        return hook.dup();
+      } else {
+        this.rpcTargets!.delete(key);
+        return hook;
+      }
+    } else {
+      hook = create();
+      if (dupStubs) {
+        if (!this.rpcTargets) {
+          this.rpcTargets = new Map;
+        }
+        this.rpcTargets.set(key, hook);
+        return hook.dup();
+      } else {
+        return hook;
+      }
+    }
+  }
 
   // Get the StubHook representing the given RpcTarget found inside this payload.
   public getHookForRpcTarget(target: RpcTarget | Function, parent: object | undefined,
@@ -849,35 +883,7 @@ export class RpcPayload {
 
       return TargetStubHook.create(target, parent);
     } else if (this.source === "return") {
-      // If dupStubs is true, we want to both make sure the map contains the stub, and also return
-      // a dup of that stub.
-      //
-      // If dupStubs is false, then we are being called as part of ensureDeepCopy(), i.e. replacing
-      // ourselves with a deep copy. In this case we actually want the copy to end up owning all
-      // the hooks, and the map to be left empty. So what we do in this case is:
-      // * If the target is not in the map, we just create it, but don't populate the map.
-      // * If the target *is* in the map, we *remove* the hook from the map, and return it.
-
-      let hook = this.rpcTargets?.get(target);
-      if (hook) {
-        if (dupStubs) {
-          return hook.dup();
-        } else {
-          this.rpcTargets?.delete(target);
-          return hook;
-        }
-      } else {
-        hook = TargetStubHook.create(target, parent);
-        if (dupStubs) {
-          if (!this.rpcTargets) {
-            this.rpcTargets = new Map;
-          }
-          this.rpcTargets.set(target, hook);
-          return hook.dup();
-        } else {
-          return hook;
-        }
-      }
+      return this.getHookForReturn(target, dupStubs, () => TargetStubHook.create(target, parent));
     } else {
       throw new Error("owned payload shouldn't contain raw RpcTargets");
     }
@@ -892,27 +898,8 @@ export class RpcPayload {
       // getWriter().
       return streamImpl.createWritableStreamHook(stream);
     } else if (this.source === "return") {
-      // Similar logic to getHookForRpcTarget().
-      let hook = this.rpcTargets?.get(stream);
-      if (hook) {
-        if (dupStubs) {
-          return hook.dup();
-        } else {
-          this.rpcTargets?.delete(stream);
-          return hook;
-        }
-      } else {
-        hook = streamImpl.createWritableStreamHook(stream);
-        if (dupStubs) {
-          if (!this.rpcTargets) {
-            this.rpcTargets = new Map;
-          }
-          this.rpcTargets.set(stream, hook);
-          return hook.dup();
-        } else {
-          return hook;
-        }
-      }
+      return this.getHookForReturn(stream, dupStubs,
+          () => streamImpl.createWritableStreamHook(stream));
     } else {
       throw new Error("owned payload shouldn't contain raw WritableStreams");
     }
@@ -924,28 +911,66 @@ export class RpcPayload {
     if (this.source === "params") {
       return streamImpl.createReadableStreamHook(stream);
     } else if (this.source === "return") {
-      let hook = this.rpcTargets?.get(stream);
-      if (hook) {
-        if (dupStubs) {
-          return hook.dup();
-        } else {
-          this.rpcTargets?.delete(stream);
-          return hook;
-        }
-      } else {
-        hook = streamImpl.createReadableStreamHook(stream);
-        if (dupStubs) {
-          if (!this.rpcTargets) {
-            this.rpcTargets = new Map;
-          }
-          this.rpcTargets.set(stream, hook);
-          return hook.dup();
-        } else {
-          return hook;
-        }
-      }
+      return this.getHookForReturn(stream, dupStubs,
+          () => streamImpl.createReadableStreamHook(stream));
     } else {
       throw new Error("owned payload shouldn't contain raw ReadableStreams");
+    }
+  }
+
+  // WebSockets that have been serialized from this payload. Unlike `rpcTargets`, this is used
+  // for both "params" and "return" payloads, and only to detect duplicates: wrapping a socket in
+  // streams has side effects (it accepts the socket, attaches its listeners, and starts pumping
+  // messages), so it can happen at most once per socket.
+  private sentWebSockets?: Set<object>;
+
+  // Get the StubHook representing the given WebSocket (the `webSocket` property of an upgrade
+  // Response) found inside this payload. The caller provides a factory that wraps the socket in
+  // a pair of streams and returns the hook for the writable half (see websocket-streams.ts; the
+  // readable half is piped separately by the caller). Attempting to serialize the same socket
+  // twice is an error; see `sentWebSockets`.
+  public getHookForWebSocket(webSocket: object, makeHook: () => StubHook): StubHook {
+    if (this.source === "owned") {
+      throw new Error("owned payload shouldn't contain raw WebSockets");
+    }
+
+    if (this.sentWebSockets?.has(webSocket)) {
+      throw new Error("A WebSocket can only be sent over RPC once.");
+    }
+    if (!this.sentWebSockets) {
+      this.sentWebSockets = new Set;
+    }
+    this.sentWebSockets.add(webSocket);
+
+    let hook = makeHook();
+    if (this.source === "params") {
+      // The export takes full ownership of the hook.
+      return hook;
+    } else {
+      // For a return, the hook is also tracked in rpcTargets so that it stays alive until the
+      // pipeline ends (and so disposeImpl()/deepCopy() can account for it).
+      if (!this.rpcTargets) {
+        this.rpcTargets = new Map;
+      }
+      this.rpcTargets.set(webSocket, hook);
+      return hook.dup();
+    }
+  }
+
+  // If serializing this payload previously created a tunnel hook for the given WebSocket,
+  // transfer or dup that hook, following the same dupStubs contract as the getHookFor*() methods
+  // above. Unlike for streams, deep-copying does NOT create a hook when none exists: wrapping a
+  // socket in a tunnel has side effects that would break a socket that is merely being delivered
+  // locally.
+  public getExistingHookForWebSocket(webSocket: object, dupStubs: boolean): StubHook | undefined {
+    let hook = this.rpcTargets?.get(webSocket);
+    if (!hook) {
+      return undefined;
+    } else if (dupStubs) {
+      return hook.dup();
+    } else {
+      this.rpcTargets!.delete(webSocket);
+      return hook;
     }
   }
 
@@ -1090,7 +1115,19 @@ export class RpcPayload {
         // Make an actual copy of the object, e.g. so the headers are copied.
         // Note that it would be incorrect to use clone() here since that would tee() the body
         // stream.
-        return new Response(resp.body, resp);
+        let result = new Response(resp.body, resp);
+
+        let webSocket = (<any>resp).webSocket;
+        if (webSocket) {
+          // A WebSocket upgrade response (Cloudflare Workers extension). Like a ReadableStream
+          // body, the copy shares the original socket -- but if serializing this payload
+          // previously wrapped the socket in a tunnel, we must take over that hook so that it
+          // is properly accounted for.
+          let hook = owner?.getExistingHookForWebSocket(webSocket, dupStubs);
+          if (hook) this.hooks!.push(hook);
+          Object.defineProperty(result, "webSocket", { value: webSocket, configurable: true });
+        }
+        return result;
       }
 
       default:
@@ -1415,7 +1452,21 @@ export class RpcPayload {
         // The body may be a ReadableStream that has an associated hook in rpcTargets.
         let resp = <Response>value;
         if (resp.body) this.disposeImpl(resp.body, resp);
-        // TODO: When we support WebSocket, we may need to dispose response.webSocket here?
+
+        let webSocket = (<any>resp).webSocket;
+        if (webSocket) {
+          let hook = this.rpcTargets?.get(webSocket);
+          if (hook) {
+            // Serialization wrapped this socket in a tunnel. Dispose our reference; if the
+            // receiver imported the tunnel, its dup keeps the socket alive.
+            this.rpcTargets!.delete(webSocket);
+            hook.dispose();
+          } else {
+            // The response was never serialized, so no one can ever receive this socket. Close
+            // it so the connection isn't left dangling.
+            try { webSocket.close(); } catch {}
+          }
+        }
         return;
       }
 
