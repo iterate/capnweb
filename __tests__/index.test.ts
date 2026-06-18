@@ -1409,6 +1409,180 @@ describe("fallbackCall", () => {
     using thing = stub.get("abc");
     expect(await thing.describe()).toBe("thing:abc");
   });
+
+  // --- Round-trip / wire-shape regression coverage -------------------------------------------
+  //
+  // The doc comment for `fallbackCall` (src/core.ts) and the inline comment in `followPath`
+  // claim that a fallback-resolved deep path "still arrives in one call -- so `stub.foo.bar(x)`
+  // is a single round trip delivered as `target[fallbackCall](["foo","bar"], [x])`", i.e. routing
+  // through `fallbackCall` adds NO extra client->server round trips versus a normally-resolved
+  // method, and promise pipelining is preserved.
+  //
+  // The existing tests above assert RESULTS but never count messages, so they would still pass if
+  // someone changed `followPath` to resolve the fallback by returning a stub that needs a second
+  // client->server hop. These tests pin the round-trip count by counting actual messages on the
+  // session transport, in both directions.
+
+  // Wrap TestHarness's transports so every sent message is recorded. We count messages per
+  // direction; a "round trip" in this protocol is a client `push`/`pull` followed by a server
+  // `resolve`, so the client->server message count is the load-bearing number.
+  function instrument(harness: TestHarness<any>) {
+    const clientSent: string[] = [];
+    const serverSent: string[] = [];
+    const origClientSend = harness.clientTransport.send.bind(harness.clientTransport);
+    const origServerSend = harness.serverTransport.send.bind(harness.serverTransport);
+    harness.clientTransport.send = async (m: string) => {
+      clientSent.push(m);
+      return origClientSend(m);
+    };
+    harness.serverTransport.send = async (m: string) => {
+      serverSent.push(m);
+      return origServerSend(m);
+    };
+    return { clientSent, serverSent };
+  }
+
+  it("delivers a deep fallback path in a single push message carrying the full path", async () => {
+    await using harness = new TestHarness(new CatchallTarget());
+    const { clientSent, serverSent } = instrument(harness);
+    const stub = harness.stub as any;
+
+    expect(await stub.a.b.c(42)).toStrictEqual({ path: ["a", "b", "c"], args: [42] });
+
+    // The whole dotted path `a.b.c` is delivered to the server in ONE `push`/`pipeline` message;
+    // there is no intermediate hop that resolves `a`, then `b`, etc.
+    const pushes = clientSent.filter(m => m.includes('"push"') || m.startsWith('["push"'));
+    expect(pushes.length).toBe(1);
+    // The single push carries the full path verbatim, exactly as the comment claims.
+    expect(pushes[0]).toContain('["a","b","c"]');
+    expect(pushes[0]).toContain("[42]");
+    // The server answers with exactly one `resolve`; no extra exchange was needed.
+    expect(serverSent.filter(m => m.includes('"resolve"')).length).toBe(1);
+  });
+
+  it("costs the same number of round trips as a normal declared method", async () => {
+    // Baseline: a normally-resolved declared method.
+    let normalClient = 0;
+    let normalServer = 0;
+    {
+      await using harness = new TestHarness(new CatchallTarget());
+      const { clientSent, serverSent } = instrument(harness);
+      const stub = harness.stub as any;
+      expect(await stub.known()).toBe("known");
+      await pumpMicrotasks();
+      normalClient = clientSent.length;
+      normalServer = serverSent.length;
+    }
+
+    // Fallback: an unknown deep path resolved via [fallbackCall].
+    let fallbackClient = 0;
+    let fallbackServer = 0;
+    {
+      await using harness = new TestHarness(new CatchallTarget());
+      const { clientSent, serverSent } = instrument(harness);
+      const stub = harness.stub as any;
+      expect(await stub.a.b.c(42)).toStrictEqual({ path: ["a", "b", "c"], args: [42] });
+      await pumpMicrotasks();
+      fallbackClient = clientSent.length;
+      fallbackServer = serverSent.length;
+    }
+
+    // Identical message traffic => identical round-trip cost. (Observed: 3 client / 1 server.)
+    expect(fallbackClient).toBe(normalClient);
+    expect(fallbackServer).toBe(normalServer);
+    // And pin the absolute shape so a future regression that adds a hop is caught even if it
+    // somehow keeps the two equal: one push (the call), one pull, one release on the client.
+    expect(normalClient).toBe(3);
+    expect(normalServer).toBe(1);
+  });
+
+  it("pipelines a nested RpcTarget returned by [fallbackCall] with no extra round trip", async () => {
+    class Thing extends RpcTarget {
+      constructor(private id: string) { super(); }
+      describe() { return `thing:${this.id}`; }
+    }
+    class Surface extends RpcTarget {
+      makeThing(id: string) { return new Thing(id); }            // declared
+      [fallbackCall](_path: (string | number)[], args: unknown[]) {
+        return new Thing(String(args[0]));                       // fallback
+      }
+    }
+
+    // Baseline: declared method returns a nested RpcTarget, then pipeline a call into it.
+    let normalClient = 0;
+    let normalServer = 0;
+    {
+      await using harness = new TestHarness(new Surface());
+      const { clientSent, serverSent } = instrument(harness);
+      const stub = harness.stub as any;
+      using thing = stub.makeThing("abc");
+      expect(await thing.describe()).toBe("thing:abc");
+      await pumpMicrotasks();
+      normalClient = clientSent.length;
+      normalServer = serverSent.length;
+    }
+
+    // Fallback: unknown property routes to [fallbackCall], which returns a nested RpcTarget; the
+    // `.describe()` call pipelines into it without waiting for the first call to resolve.
+    let fallbackClient = 0;
+    let fallbackServer = 0;
+    {
+      await using harness = new TestHarness(new Surface());
+      const { clientSent, serverSent } = instrument(harness);
+      const stub = harness.stub as any;
+      using thing = stub.get("abc");
+      expect(await thing.describe()).toBe("thing:abc");
+      await pumpMicrotasks();
+      fallbackClient = clientSent.length;
+      fallbackServer = serverSent.length;
+    }
+
+    // The fallback nested-pipelining path costs exactly the same as the declared one.
+    expect(fallbackClient).toBe(normalClient);
+    expect(fallbackServer).toBe(normalServer);
+    // Pin the shape: two pushes are sent (the first call and the pipelined `.describe()`), and the
+    // second push goes out before the server resolves the first -- i.e. only ONE pull/resolve
+    // exchange happens for both calls. (Observed: 4 client / 1 server.)
+    expect(normalServer).toBe(1);
+  });
+
+  it("fires a [fallbackCall] on a client-provided RpcTarget across the connection", async () => {
+    // The server lets a client publish a capability and resolves dynamic names to it: the server's
+    // own [fallbackCall] looks the name up and forwards the rest of the path onto the provided stub.
+    class Server extends RpcTarget {
+      #caps = new Map<string, any>();
+      // `dup()` keeps the provided stub alive past this call (params are otherwise auto-disposed).
+      provideCapability(name: string, cap: any) { this.#caps.set(name, cap.dup()); }
+      revoke(name: string) { this.#caps.get(name)?.[Symbol.dispose](); this.#caps.delete(name); }
+      [fallbackCall](path: (string | number)[], args: unknown[]) {
+        const [name, ...rest] = path;
+        const cap = this.#caps.get(String(name));
+        if (!cap) throw new Error(`no capability named "${String(name)}"`);
+        // Forward the remaining path onto the provided (client-side) capability and call it.
+        return rest.reduce<any>((c, k) => c[k], cap)(...args);
+      }
+    }
+
+    await using harness = new TestHarness(new Server());
+    let session = harness.stub as any;
+
+    // The capability the client provides is itself an RpcTarget whose dynamic surface is a fallback.
+    class ClientCap extends RpcTarget {
+      [fallbackCall](path: (string | number)[], args: unknown[]) {
+        return { hitClientFallback: path, args };
+      }
+    }
+    await session.provideCapability("myCap", new ClientCap());
+
+    // session.myCap.something.something(...) routes: caller -> server (resolves myCap, forwards the
+    // rest) -> back across the connection to the client's ClientCap -> ITS [fallbackCall].
+    expect(await session.myCap.something.somethingElse("this hits the client fallback")).toStrictEqual({
+      hitClientFallback: ["something", "somethingElse"],
+      args: ["this hits the client fallback"],
+    });
+
+    await session.revoke("myCap"); // release the duped capability so the session ends clean
+  });
 });
 
 describe("map() over RPC", () => {
