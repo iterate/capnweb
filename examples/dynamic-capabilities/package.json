@@ -1,0 +1,22 @@
+{
+  "name": "capnweb-dynamic-capabilities-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cf-typegen": "wrangler types",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "npm run cf-typegen && vitest run",
+    "typecheck": "npm run cf-typegen && tsc --noEmit"
+  },
+  "dependencies": {
+    "capnweb": "file:../.."
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.16.16",
+    "@cloudflare/workers-types": "4.20260617.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.9",
+    "wrangler": "4.101.0"
+  }
+}

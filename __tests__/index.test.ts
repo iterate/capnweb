@@ -4,7 +4,7 @@
 
 import { expect, it, describe, inject } from "vitest"
 import { deserialize, serialize, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
-         RpcStub, newWebSocketRpcSession, newMessagePortRpcSession,
+         RpcStub, RpcPromise, newWebSocketRpcSession, newMessagePortRpcSession,
          newHttpBatchRpcSession, fallbackCall} from "../src/index.js"
 import { Counter, TestTarget } from "./test-util.js";
 import { registerSessionTestBattery } from "./session-battery.js";
@@ -534,6 +534,35 @@ class TestHarness<T extends RpcTarget> {
       }
       expect.soft(true, message).toBe(false);
     }
+  }
+}
+
+class FallbackOnlyTarget extends RpcTarget {
+  constructor(private target: any, private wrapReturnedTargets = false) {
+    super();
+  }
+
+  [fallbackCall](path: (string | number)[], args: unknown[]) {
+    if (path.length === 0) {
+      throw new TypeError("fallback call path cannot be empty");
+    }
+
+    let value = this.target;
+    for (let part of path.slice(0, -1)) {
+      value = value[part];
+    }
+
+    let leaf = path[path.length - 1];
+    let func = value[leaf];
+    if (typeof func !== "function") {
+      throw new TypeError(`'${path.join(".")}' is not a function.`);
+    }
+
+    let result = func.apply(value, args);
+    if (this.wrapReturnedTargets && result instanceof RpcTarget) {
+      return new FallbackOnlyTarget(result, true);
+    }
+    return result;
   }
 }
 
@@ -1383,6 +1412,19 @@ describe("fallbackCall", () => {
     await expect(() => stub.unknown.deep()).rejects.toThrow(TypeError);
   });
 
+  it("does not hide RpcTarget instance-property errors behind [fallbackCall]", async () => {
+    class PrivateCatchall extends RpcTarget {
+      token = "secret";
+      [fallbackCall](path: (string | number)[], args: unknown[]) {
+        return { path, args };
+      }
+    }
+    let stub = new RpcStub(new PrivateCatchall()) as any;
+
+    await expect(stub.token()).rejects.toThrow("instance property of the RpcTarget");
+    expect(await stub.missing()).toStrictEqual({ path: ["missing"], args: [] });
+  });
+
   it("forwards gets: await an unknown name, then call/navigate the resulting handle", async () => {
     let stub = new RpcStub(new CatchallTarget()) as any;
     // A bare get of an unknown name yields a usable handle (not a dead wrapper)...
@@ -1470,6 +1512,21 @@ describe("fallbackCall", () => {
     expect(pushes[0]).toContain("[42]");
     // The server answers with exactly one `resolve`; no extra exchange was needed.
     expect(serverSent.filter(m => m.includes('"resolve"')).length).toBe(1);
+  });
+
+  it("serializes numeric fallback path segments as numbers on the wire", async () => {
+    await using harness = new TestHarness(new CatchallTarget());
+    const { clientSent } = instrument(harness);
+    const stub = harness.stub as any;
+
+    expect(await stub.items[0].ping("x")).toStrictEqual({
+      path: ["items", 0, "ping"],
+      args: ["x"],
+    });
+
+    const pushes = clientSent.filter(m => m.includes('"push"') || m.startsWith('["push"'));
+    expect(pushes.length).toBe(1);
+    expect(pushes[0]).toContain('["items",0,"ping"]');
   });
 
   it("costs the same number of round trips as a normal declared method", async () => {
@@ -1594,6 +1651,298 @@ describe("fallbackCall", () => {
     });
 
     await session.revoke("myCap"); // release the duped capability so the session ends clean
+  });
+
+  it("routes function-intrinsic names through [fallbackCall] on awaited fallback handles", async () => {
+    let stub = new RpcStub(new CatchallTarget()) as any;
+
+    let handle = await stub.dynamic;
+
+    expect(await handle.name("x")).toStrictEqual({ path: ["dynamic", "name"], args: ["x"] });
+    expect(await handle.length.more("y")).toStrictEqual({
+      path: ["dynamic", "length", "more"],
+      args: ["y"],
+    });
+  });
+
+  it("preserves numeric path segments on direct fallback navigation", async () => {
+    let stub = new RpcStub(new CatchallTarget()) as any;
+
+    expect(await stub.items[0].ping("x")).toStrictEqual({
+      path: ["items", 0, "ping"],
+      args: ["x"],
+    });
+    expect(await stub.items["01"].ping("y")).toStrictEqual({
+      path: ["items", "01", "ping"],
+      args: ["y"],
+    });
+  });
+
+  it("pipelines through numeric indexes on arrays returned by [fallbackCall]", async () => {
+    class Thing extends RpcTarget {
+      constructor(private id: string) { super(); }
+      ping() { return `thing:${this.id}`; }
+    }
+    class Surface extends RpcTarget {
+      [fallbackCall](path: (string | number)[], _args: unknown[]) {
+        if (path.length === 1 && path[0] === "list") {
+          return [new Thing("zero")];
+        }
+        throw new Error(`unexpected fallback path ${path.join(".")}`);
+      }
+    }
+
+    await using harness = new TestHarness(new Surface());
+    let stub = harness.stub as any;
+
+    using list = stub.list();
+    expect(await list[0].ping()).toBe("thing:zero");
+  });
+
+  it("keeps numeric-string object keys traversable after fallbackCall", async () => {
+    class Thing extends RpcTarget {
+      constructor(private id: string) { super(); }
+      ping() { return `thing:${this.id}`; }
+    }
+    class Surface extends RpcTarget {
+      [fallbackCall](path: (string | number)[], _args: unknown[]) {
+        if (path.length === 1 && path[0] === "record") {
+          return { "0": new Thing("string-zero") };
+        }
+        throw new Error(`unexpected fallback path ${path.join(".")}`);
+      }
+    }
+
+    await using harness = new TestHarness(new Surface());
+    let stub = harness.stub as any;
+
+    using record = stub.record();
+    expect(await record["0"].ping()).toBe("thing:string-zero");
+  });
+
+  it("pipelines through a Promise<RpcTarget> returned by [fallbackCall] before it resolves",
+      async () => {
+    class Child extends RpcTarget {
+      constructor(private id: string) { super(); }
+      describe(label = "") { return `child:${this.id}:${label}`; }
+    }
+
+    let release!: (child: Child) => void;
+    let childPromise = new Promise<Child>(resolve => { release = resolve; });
+
+    class Surface extends RpcTarget {
+      [fallbackCall](path: (string | number)[], _args: unknown[]) {
+        if (path.length === 1 && path[0] === "make") {
+          return childPromise;
+        }
+        throw new Error(`unexpected fallback path ${path.join(".")}`);
+      }
+    }
+
+    await using harness = new TestHarness(new Surface());
+    harness.serverTransport.fence();
+
+    using child = (harness.stub as any).make("ignored");
+    using pipelined = child.describe("early");
+    await pumpMicrotasks();
+
+    expect(harness.serverTransport.pendingCount).toBe(2);
+
+    release(new Child("async"));
+    harness.serverTransport.releaseFence();
+
+    expect(await pipelined).toBe("child:async:early");
+  });
+
+  it("rejects calls pipelined through a rejected [fallbackCall] result with the fallback reason",
+      async () => {
+    class Surface extends RpcTarget {
+      [fallbackCall](path: (string | number)[], _args: unknown[]) {
+        if (path.length === 1 && path[0] === "missing") {
+          return Promise.reject(new Error("fallback unavailable"));
+        }
+        throw new Error(`unexpected fallback path ${path.join(".")}`);
+      }
+    }
+
+    await using harness = new TestHarness(new Surface());
+
+    using missing = (harness.stub as any).missing();
+    using pipelined = missing.describe("nope");
+
+    await expect(pipelined).rejects.toThrow("fallback unavailable");
+  });
+
+  it("keeps RpcPromise/RpcStub helper names reserved instead of fallback path segments", () => {
+    let stub = new RpcStub(new CatchallTarget()) as any;
+    let promise = stub.dynamic;
+
+    // These are local control-surface names, not remote application names: then/catch/finally
+    // provide JavaScript promise interop, and map/dup/onRpcBroken/toString provide RPC lifecycle
+    // and helper APIs. This test fails if Proxy.get stops checking RpcPromise.prototype before
+    // constructing dynamic path promises.
+    for (let name of ["then", "catch", "finally"]) {
+      expect(promise[name]).toBe((RpcPromise as any).prototype[name]);
+    }
+
+    for (let name of ["map", "dup", "onRpcBroken"]) {
+      expect(stub[name]).toBe((RpcStub as any).prototype[name]);
+      expect(promise[name]).toBe((RpcStub as any).prototype[name]);
+    }
+    expect(stub.toString).toBe((RpcStub as any).prototype.toString);
+    expect(promise.toString).toBe((RpcPromise as any).prototype.toString);
+  });
+
+  it("keeps Object.prototype names reserved even on fallback-returned objects", async () => {
+    // Object.prototype names stay blocked to match deserialization's prototype-pollution rules.
+    // The $remove$ transport hack forces a real remote lookup; these assertions fail if followPath
+    // starts exposing Object.prototype names, even when the object defines an own override.
+    class Surface extends RpcTarget {
+      [fallbackCall](path: (string | number)[], _args: unknown[]) {
+        if (path.length === 1 && path[0] === "object") {
+          return {
+            value: 123,
+            toString() { return "should not be exposed"; },
+            hasOwnProperty() { return "should not be exposed"; },
+          };
+        }
+        throw new Error(`unexpected fallback path ${path.join(".")}`);
+      }
+    }
+
+    await using harness = new TestHarness(new Surface());
+    let stub = harness.stub as any;
+
+    using object = stub.object();
+    expect(await object.value).toBe(123);
+    expect(await object.$remove$toString).toBe(undefined);
+    expect(await object.$remove$hasOwnProperty).toBe(undefined);
+    expect(await object.$remove$constructor).toBe(undefined);
+  });
+
+  it.each(["call", "apply", "bind"])(
+      "routes non-reserved function helper name %s through [fallbackCall]",
+      async (name) => {
+    let stub = new RpcStub(new CatchallTarget()) as any;
+
+    expect(await stub.dynamic[name]("x")).toStrictEqual({
+      path: ["dynamic", name],
+      args: ["x"],
+    });
+  });
+
+  it("routes a Slack-shaped nested client capability through the provider fallback", async () => {
+    class Server extends RpcTarget {
+      #caps = new Map<string, any>();
+      provideCapability(name: string, cap: any) { this.#caps.set(name, cap.dup()); }
+      revoke(name: string) { this.#caps.get(name)?.[Symbol.dispose](); this.#caps.delete(name); }
+      [fallbackCall](path: (string | number)[], args: unknown[]) {
+        const [name, ...rest] = path;
+        const cap = this.#caps.get(String(name));
+        if (!cap) throw new Error(`no capability named "${String(name)}"`);
+        return rest.reduce<any>((c, k) => c[k], cap)(...args);
+      }
+    }
+
+    class SlackLikeClient extends RpcTarget {
+      [fallbackCall](path: (string | number)[], args: unknown[]) {
+        return { slackPath: path, args };
+      }
+    }
+
+    await using harness = new TestHarness(new Server());
+    let session = harness.stub as any;
+
+    await session.provideCapability("slack", new SlackLikeClient());
+
+    expect(await session.slack.chat.postMessage({
+      channel: "C123",
+      text: "hi",
+    })).toStrictEqual({
+      slackPath: ["chat", "postMessage"],
+      args: [{ channel: "C123", text: "hi" }],
+    });
+
+    await session.revoke("slack");
+  });
+
+  it("pipelines through a getter on an RpcTarget returned by [fallbackCall]", async () => {
+    class Child extends RpcTarget {
+      ping() { return "pong"; }
+    }
+    class Parent extends RpcTarget {
+      get child() { return new Child(); }
+    }
+    class Surface extends RpcTarget {
+      [fallbackCall](path: (string | number)[], _args: unknown[]) {
+        if (path.length === 1 && path[0] === "parent") {
+          return new Parent();
+        }
+        throw new Error(`unexpected fallback path ${path.join(".")}`);
+      }
+    }
+
+    await using harness = new TestHarness(new Surface());
+    let stub = harness.stub as any;
+
+    using parent = stub.parent();
+    expect(await parent.child.ping()).toBe("pong");
+  });
+
+  it("routes function-intrinsic names through [fallbackCall] on callable dynamic capabilities",
+      async () => {
+    function makeCallableDynamicCapability() {
+      let callable = (value: string) => `called:${value}`;
+      (<any>callable).child = new class extends RpcTarget {
+        ping() { return "child:pong"; }
+      }();
+      (<any>callable)[fallbackCall] = (path: (string | number)[], args: unknown[]) => {
+        return { path, args };
+      };
+      return callable;
+    }
+
+    class Surface extends RpcTarget {
+      [fallbackCall](path: (string | number)[], _args: unknown[]) {
+        if (path.length === 1 && path[0] === "tool") {
+          return makeCallableDynamicCapability();
+        }
+        throw new Error(`unexpected fallback path ${path.join(".")}`);
+      }
+    }
+
+    await using harness = new TestHarness(new Surface());
+    let stub = harness.stub as any;
+
+    using tool = stub.tool();
+    expect(await tool("root")).toBe("called:root");
+    expect(await tool.child.ping()).toBe("child:pong");
+    expect(await tool.name("x")).toStrictEqual({ path: ["name"], args: ["x"] });
+    expect(await tool.length.more("y")).toStrictEqual({
+      path: ["length", "more"],
+      args: ["y"],
+    });
+  });
+});
+
+describe("fallbackCall compatibility battery", () => {
+  registerSessionTestBattery(async () => {
+    let harness = new TestHarness(new FallbackOnlyTarget(new TestTarget()));
+    return {
+      stub: harness.stub as any,
+      async [Symbol.asyncDispose]() { await harness[Symbol.asyncDispose](); },
+    };
+  });
+
+  it("can recursively wrap returned RpcTargets and still pipeline calls into them", async () => {
+    await using harness = new TestHarness(new FallbackOnlyTarget(new TestTarget(), true));
+    let stub = harness.stub as any;
+
+    using counter = stub.makeCounter(10);
+    using incremented = counter.increment(5);
+
+    expect(await incremented).toBe(15);
+    expect(await counter.increment(1)).toBe(16);
   });
 });
 

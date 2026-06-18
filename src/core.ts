@@ -38,9 +38,10 @@ export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};
 /**
  * Optional method key for a fallback call handler on an `RpcTarget`.
  *
- * When a path reaches a property the target's class doesn't define as a method or getter, capnweb
- * normally resolves it to `undefined`. If the target instead defines a method under this symbol,
- * the unmatched remainder of the path and the call's arguments are forwarded to it:
+ * When a path reaches a property the target's class doesn't define as a method or getter, and that
+ * name is not an instance property or local stub helper, capnweb normally resolves it to
+ * `undefined`. If the target instead defines a method under this symbol, the unmatched remainder of
+ * the path and the call's arguments are forwarded to it:
  *
  * ```ts
  * import { RpcTarget, fallbackCall } from "capnweb";
@@ -54,8 +55,10 @@ export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};
  * ```
  *
  * It runs through the normal call path, so it may be `async`, and the whole dotted path still
- * arrives in one call -- so `stub.foo.bar(x)` is a single round trip delivered as
- * `target[fallbackCall](["foo","bar"], [x])`. `path` is relative to where matching stopped.
+ * arrives in one call with the same round-trip cost as a declared method -- so `stub.foo.bar(x)` is
+ * delivered as `target[fallbackCall](["foo","bar"], [x])`. `path` is relative to where matching
+ * stopped. Canonical numeric indexes like `stub.items[0]` arrive as number path parts; local stub
+ * helper names like `then`, `map`, and `dup` stay local and do not become fallback path segments.
  *
  * Gets work too: `const cap = await stub.foo; cap.bar(x)` resolves `cap` to a handle that keeps
  * routing to the fallback, delivering `target[fallbackCall](["foo","bar"], [x])`.
@@ -375,6 +378,16 @@ export interface RpcStub extends Disposable {
   [RAW_STUB]: this;
 }
 
+function propertyPathPart(prop: string): string | number {
+  let number = Number(prop);
+  // Bracket access like `stub.list()[0]` reaches Proxy.get() as the string "0"; JS gives proxies
+  // no way to distinguish that from `stub.list()["0"]`. Canonical numeric strings to numbers so
+  // the wire path can carry numeric segments and followPath() can traverse arrays. Plain object
+  // keys like "0" still work because object property access coerces 0 back to "0". Without this,
+  // the numeric fallback path and fallback array-index pipelining tests fail with string "0".
+  return Number.isSafeInteger(number) && number >= 0 && String(number) === prop ? number : prop;
+}
+
 const PROXY_HANDLERS: ProxyHandler<{raw: RpcStub}> = {
   apply(target: {raw: RpcStub}, thisArg: any, argumentsList: any[]) {
     let stub = target.raw;
@@ -391,13 +404,18 @@ const PROXY_HANDLERS: ProxyHandler<{raw: RpcStub}> = {
       // Object) should pass through to the target object, as trying to turn these into RPCs will
       // likely be problematic.
       //
+      // In particular, `then` must stay local for await/Promise.resolve() interop, while
+      // `map`, `dup`, and `onRpcBroken` are RPC helper/lifecycle APIs. The reserved-name fallback
+      // test pins this: dynamic fallback paths cannot claim these names through property syntax.
+      //
       // Note we don't just check `prop in target` because we intentionally want to hide the
       // properties `hook` and `path`.
       return (<any>stub)[prop];
     } else if (typeof prop === "string") {
       // Return promise for property.
+      let part = propertyPathPart(prop);
       return new RpcPromise(stub.hook,
-          stub.pathIfPromise ? [...stub.pathIfPromise, prop] : [prop]);
+          stub.pathIfPromise ? [...stub.pathIfPromise, part] : [part]);
     } else if (prop === Symbol.dispose &&
           (!stub.pathIfPromise || stub.pathIfPromise.length == 0)) {
       // We only advertise Symbol.dispose on stubs and root promises, not properties.
@@ -1576,6 +1594,17 @@ function makeFallbackResult(target: object, remainingPath: PropertyPath): Follow
   return { value: wrapper, parent: target, owner: null };
 }
 
+function isFallbackFunctionIntrinsic(value: unknown, part: string | number): boolean {
+  // Fallback-capable functions use function objects as dynamic RPC handles. JavaScript gives every
+  // function own `name` and `length` properties, so the normal Object.hasOwn() branch would consume
+  // those path segments before fallback routing can see them. Without this exception, the tests
+  // "routes function-intrinsic names through [fallbackCall] on awaited fallback handles" and
+  // "routes function-intrinsic names through [fallbackCall] on callable dynamic capabilities" fail.
+  return typeof value === "function" &&
+      typeof (<any>value)[fallbackCall] === "function" &&
+      (part === "name" || part === "length");
+}
+
 function followPath(value: unknown, parent: object | undefined,
                     path: PropertyPath, owner: RpcPayload | null): FollowPathResult {
   for (let i = 0; i < path.length; i++) {
@@ -1598,12 +1627,11 @@ function followPath(value: unknown, parent: object | undefined,
       case "object":
       case "function":
         // Must be own property, NOT inherited from a prototype.
-        if (Object.hasOwn(<object>value, part)) {
+        if (Object.hasOwn(<object>value, part) && !isFallbackFunctionIntrinsic(value, part)) {
           value = (<any>value)[part];
         } else if (typeof (<any>value)[fallbackCall] === "function") {
-          // A fallback wrapper (a function that also carries `fallbackCall`) reaches here when a
-          // get() deep-copied it into a stub and the caller then navigates further. Re-enter the
-          // fallback so gets behave like calls. See `fallbackCall` / `makeFallbackResult`.
+          // A fallback wrapper, or an app-provided callable with its own fallback, reaches here
+          // when a get() deep-copied it into a stub and the caller then navigates further.
           return makeFallbackResult(<object>value, path.slice(i));
         } else {
           value = undefined;
