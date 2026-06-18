@@ -22,6 +22,9 @@ export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpc
          nodeHttpBatchRpcResponse };
 export type { RpcTransport, RpcSessionOptions, RpcCompatible };
 
+// Opt-in fallback call handler for RpcTargets (see the symbol's doc comment in core.ts).
+export { fallbackCall } from "./core.js";
+
 // Hack the type system to make RpcStub's types work nicely!
 /**
  * Represents a reference to a remote object, on which methods may be remotely invoked via RPC.

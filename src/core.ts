@@ -35,6 +35,30 @@ export interface RpcTarget {
 
 export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};
 
+/**
+ * Optional method key for a fallback call handler on an `RpcTarget`.
+ *
+ * When a path reaches a property the target's class doesn't define as a method or getter, capnweb
+ * normally resolves it to `undefined`. If the target instead defines a method under this symbol,
+ * the unmatched remainder of the path and the call's arguments are forwarded to it:
+ *
+ * ```ts
+ * import { RpcTarget, fallbackCall } from "capnweb";
+ *
+ * class Surface extends RpcTarget {
+ *   knownMethod() { ... }                 // resolved natively, as usual
+ *   [fallbackCall](path, args) {
+ *     return this.resolveDynamically(path, args);   // anything else
+ *   }
+ * }
+ * ```
+ *
+ * It runs through the normal call path, so it may be `async`, and the whole dotted path still
+ * arrives in one call -- so `stub.foo.bar(x)` is a single round trip delivered as
+ * `target[fallbackCall](["foo","bar"], [x])`. `path` is relative to where matching stopped.
+ */
+export const fallbackCall = Symbol("capnweb.fallbackCall");
+
 export type PropertyPath = (string | number)[];
 
 type TypeForRpc = "unsupported" | "primitive" | "object" | "function" | "array" | "date" |
@@ -1587,6 +1611,17 @@ function followPath(value: unknown, parent: object | undefined,
               `RpcTarget. To avoid leaking private internals, instance properties cannot be ` +
               `accessed over RPC. If you want to make this property available over RPC, define ` +
               `it as a method or getter on the class, instead of an instance property.`);
+        } else if (!(part in <object>value) && typeof (<any>value)[fallbackCall] === "function") {
+          // Not a declared method/getter, but the target has a fallback handler. Return it as a
+          // plain function carrying the rest of the path, so the normal call path (deliverCall)
+          // invokes it with the args and awaits the result. See `fallbackCall`.
+          let target = <object>value;
+          let remainingPath = path.slice(i);
+          return {
+            value: (...args: unknown[]) => (<any>target)[fallbackCall](remainingPath, args),
+            parent: target,
+            owner: null,
+          };
         } else {
           value = (<any>value)[part];
         }

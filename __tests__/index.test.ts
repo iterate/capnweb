@@ -5,7 +5,7 @@
 import { expect, it, describe, inject } from "vitest"
 import { deserialize, serialize, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
          RpcStub, newWebSocketRpcSession, newMessagePortRpcSession,
-         newHttpBatchRpcSession} from "../src/index.js"
+         newHttpBatchRpcSession, fallbackCall} from "../src/index.js"
 import { Counter, TestTarget } from "./test-util.js";
 import { registerSessionTestBattery } from "./session-battery.js";
 
@@ -1334,6 +1334,80 @@ describe("promise pipelining", () => {
 
     await expect(() => promise).rejects.toThrow("test error");
     await expect(() => promise2).rejects.toThrow("test error");
+  });
+});
+
+describe("fallbackCall", () => {
+  class CatchallTarget extends RpcTarget {
+    known() { return "known"; }
+    get knownGetter() { return "getter"; }
+
+    // Receives the unmatched path remainder and the call's arguments.
+    [fallbackCall](path: (string | number)[], args: unknown[]) {
+      return { path, args };
+    }
+  }
+
+  it("resolves declared methods/getters natively, not via fallbackCall", async () => {
+    let stub = new RpcStub(new CatchallTarget());
+    expect(await stub.known()).toBe("known");
+    expect(await stub.knownGetter).toBe("getter");
+  });
+
+  it("forwards an unknown leaf call to [fallbackCall] with (path, args)", async () => {
+    let stub = new RpcStub(new CatchallTarget()) as any;
+    expect(await stub.unknown("x", 1)).toStrictEqual({ path: ["unknown"], args: ["x", 1] });
+  });
+
+  it("forwards the unmatched suffix of a deep unknown path", async () => {
+    let stub = new RpcStub(new CatchallTarget()) as any;
+    expect(await stub.a.b.c(42)).toStrictEqual({ path: ["a", "b", "c"], args: [42] });
+  });
+
+  it("awaits an async [fallbackCall] result", async () => {
+    class AsyncCatchall extends RpcTarget {
+      [fallbackCall](path: (string | number)[], args: unknown[]) {
+        return Promise.resolve(`${path.join(".")}(${args.join(",")})`);
+      }
+    }
+    let stub = new RpcStub(new AsyncCatchall()) as any;
+    expect(await stub.load.thing("id")).toBe("load.thing(id)");
+  });
+
+  it("leaves targets without a [fallbackCall] unchanged (unknown -> undefined)", async () => {
+    class NoCatchall extends RpcTarget {
+      known() { return 1; }
+    }
+    let stub = new RpcStub(new NoCatchall()) as any;
+    expect(await stub.unknown).toBe(undefined);
+    await expect(() => stub.unknown.deep()).rejects.toThrow(TypeError);
+  });
+
+  it("preserves promise pipelining over a real session (single call)", async () => {
+    await using harness = new TestHarness(new CatchallTarget());
+    let stub = harness.stub as any;
+    // `stub.dynamic.capability("arg")` accumulates the whole path on the client and is delivered
+    // to the server as a single call, so the fallback handler sees the full path in one round trip.
+    expect(await stub.dynamic.capability("arg")).toStrictEqual({
+      path: ["dynamic", "capability"], args: ["arg"],
+    });
+  });
+
+  it("lets a [fallbackCall] return a nested RpcTarget that pipelines further", async () => {
+    class Thing extends RpcTarget {
+      constructor(private id: string) { super(); }
+      describe() { return `thing:${this.id}`; }
+    }
+    class Surface extends RpcTarget {
+      [fallbackCall](_path: (string | number)[], args: unknown[]) {
+        return new Thing(String(args[0]));
+      }
+    }
+    await using harness = new TestHarness(new Surface());
+    let stub = harness.stub as any;
+    // `get` is unknown -> fallbackCall -> returns a Thing stub; `.describe()` pipelines into it.
+    using thing = stub.get("abc");
+    expect(await thing.describe()).toBe("thing:abc");
   });
 });
 
