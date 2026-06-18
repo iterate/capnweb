@@ -56,6 +56,9 @@ export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};
  * It runs through the normal call path, so it may be `async`, and the whole dotted path still
  * arrives in one call -- so `stub.foo.bar(x)` is a single round trip delivered as
  * `target[fallbackCall](["foo","bar"], [x])`. `path` is relative to where matching stopped.
+ *
+ * Gets work too: `const cap = await stub.foo; cap.bar(x)` resolves `cap` to a handle that keeps
+ * routing to the fallback, delivering `target[fallbackCall](["foo","bar"], [x])`.
  */
 export const fallbackCall = Symbol("capnweb.fallbackCall");
 
@@ -1559,6 +1562,20 @@ type FollowPathResult = {
   owner?: never,
 };
 
+// Builds a dual-purpose fallback handle for a path that reached an undeclared property on a
+// [fallbackCall] target. The returned value is a function (so `call()` can deliverCall it with the
+// args) that ALSO carries `fallbackCall` itself -- so if it is instead get()'d into a stub and
+// navigated further, the "function" case of followPath re-enters the fallback with the accumulated
+// path. This makes a get-then-call (`const t = await stub.dynamic; t.foo(x)`) behave like a direct
+// call, through one mechanism.
+function makeFallbackResult(target: object, remainingPath: PropertyPath): FollowPathResult {
+  let wrapper = (...args: unknown[]) => (<any>target)[fallbackCall](remainingPath, args);
+  (<any>wrapper)[fallbackCall] =
+      (sub: PropertyPath, args: unknown[]) =>
+          (<any>target)[fallbackCall]([...remainingPath, ...sub], args);
+  return { value: wrapper, parent: target, owner: null };
+}
+
 function followPath(value: unknown, parent: object | undefined,
                     path: PropertyPath, owner: RpcPayload | null): FollowPathResult {
   for (let i = 0; i < path.length; i++) {
@@ -1583,6 +1600,11 @@ function followPath(value: unknown, parent: object | undefined,
         // Must be own property, NOT inherited from a prototype.
         if (Object.hasOwn(<object>value, part)) {
           value = (<any>value)[part];
+        } else if (typeof (<any>value)[fallbackCall] === "function") {
+          // A fallback wrapper (a function that also carries `fallbackCall`) reaches here when a
+          // get() deep-copied it into a stub and the caller then navigates further. Re-enter the
+          // fallback so gets behave like calls. See `fallbackCall` / `makeFallbackResult`.
+          return makeFallbackResult(<object>value, path.slice(i));
         } else {
           value = undefined;
         }
@@ -1612,16 +1634,10 @@ function followPath(value: unknown, parent: object | undefined,
               `accessed over RPC. If you want to make this property available over RPC, define ` +
               `it as a method or getter on the class, instead of an instance property.`);
         } else if (!(part in <object>value) && typeof (<any>value)[fallbackCall] === "function") {
-          // Not a declared method/getter, but the target has a fallback handler. Return it as a
-          // plain function carrying the rest of the path, so the normal call path (deliverCall)
-          // invokes it with the args and awaits the result. See `fallbackCall`.
-          let target = <object>value;
-          let remainingPath = path.slice(i);
-          return {
-            value: (...args: unknown[]) => (<any>target)[fallbackCall](remainingPath, args),
-            parent: target,
-            owner: null,
-          };
+          // Not a declared method/getter, but the target has a fallback handler. Return a wrapper
+          // that both calls the fallback (deliverCall path) and re-enters it when navigated further
+          // after a get(). See `fallbackCall` / `makeFallbackResult`.
+          return makeFallbackResult(<object>value, path.slice(i));
         } else {
           value = (<any>value)[part];
         }

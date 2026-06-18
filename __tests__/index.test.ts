@@ -1383,6 +1383,18 @@ describe("fallbackCall", () => {
     await expect(() => stub.unknown.deep()).rejects.toThrow(TypeError);
   });
 
+  it("forwards gets: await an unknown name, then call/navigate the resulting handle", async () => {
+    let stub = new RpcStub(new CatchallTarget()) as any;
+    // A bare get of an unknown name yields a usable handle (not a dead wrapper)...
+    const handle = await stub.dynamic;
+    // ...calling into it routes back through [fallbackCall] with the accumulated path,
+    expect(await handle.foo("x")).toStrictEqual({ path: ["dynamic", "foo"], args: ["x"] });
+    // including deep navigation after the get,
+    expect(await handle.a.b("y")).toStrictEqual({ path: ["dynamic", "a", "b"], args: ["y"] });
+    // and the handle itself is still directly callable.
+    expect(await handle("z")).toStrictEqual({ path: ["dynamic"], args: ["z"] });
+  });
+
   it("preserves promise pipelining over a real session (single call)", async () => {
     await using harness = new TestHarness(new CatchallTarget());
     let stub = harness.stub as any;
