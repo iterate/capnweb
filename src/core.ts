@@ -214,6 +214,20 @@ export type StreamImpl = {
   createReadableStreamHook(stream: ReadableStream): StubHook;
 }
 
+/** Information about one application function invocation received over RPC. */
+export type RpcCallInfo = {
+  /** The property path used to reach the function from the referenced capability. */
+  path: PropertyPath;
+  /** The object that owns the function, or the function itself for a callable capability. */
+  target: unknown;
+};
+
+/**
+ * Wraps one local application invocation. `invoke()` must be called synchronously so Cap'n Web's
+ * e-order guarantees are preserved, but the returned promise remains pending for the full call.
+ */
+export type RpcCallHandler = <T>(info: RpcCallInfo, invoke: () => Promise<T>) => Promise<T>;
+
 // Inner interface backing an RpcStub or RpcPromise.
 //
 // A hook may eventually resolve to a "payload".
@@ -852,8 +866,9 @@ export class RpcPayload {
   // When done, the payload takes ownership of the final value and all the stubs within. It may
   // modify the value in preparation for delivery, and may deliver the value directly to the app
   // without copying.
-  public static forEvaluate(hooks: StubHook[], promises: LocatedPromise[]) {
-    return new RpcPayload(null, "owned", hooks, promises);
+  public static forEvaluate(
+      hooks: StubHook[], promises: LocatedPromise[], callHandler?: RpcCallHandler) {
+    return new RpcPayload(null, "owned", hooks, promises, callHandler);
   }
 
   // Deep-copy the given value, including dup()ing all stubs.
@@ -893,7 +908,11 @@ export class RpcPayload {
 
     // All promises found in `value`. The locations of each promise are provided to allow
     // substitutions later.
-    private promises?: LocatedPromise[]
+    private promises?: LocatedPromise[],
+
+    // Optional server hook carried by received call arguments. Keeping it on the payload means it
+    // naturally survives while a promise-pipelined target resolves.
+    public callHandler?: RpcCallHandler
   ) {}
 
   // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets,
@@ -1854,8 +1873,26 @@ abstract class ValueStubHook extends StubHook {
     }
 
     // deliverCall() is async and disposes `args` itself when the call completes, so it never
-    // needs a guard here.
-    let promise = args.deliverCall(followResult.value, followResult.parent);
+    // needs a guard here. If a callHandler throws synchronously without having invoked the
+    // call, no callee ever took ownership of `args`, so dispose them here.
+    const func = followResult.value;
+    let invoked = false;
+    const invoke = () => {
+      invoked = true;
+      return args.deliverCall(func, followResult.parent);
+    };
+    let promise;
+    try {
+      promise = args.callHandler
+        ? args.callHandler({
+            path: [...path],
+            target: followResult.parent ?? followResult.value,
+          }, invoke)
+        : invoke();
+    } catch (err) {
+      if (!invoked) args.dispose();
+      return new ErrorStubHook(err);
+    }
     return new PromiseStubHook(promise.then(payload => {
       return new PayloadStubHook(payload);
     }));
