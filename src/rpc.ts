@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, RpcStub, PropertyPath, PayloadStubHook, ErrorStubHook, RpcTarget, unwrapStubAndPath, streamImpl } from "./core.js";
+import { StubHook, RpcPayload, RpcStub, PropertyPath, PayloadStubHook, ErrorStubHook, RpcTarget, unwrapStubAndPath, streamImpl, type RpcCallHandler } from "./core.js";
 import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize } from "./serialize.js";
 
 /**
@@ -316,6 +316,13 @@ export type RpcSessionOptions = {
    * to serialize the error with the stack omitted.
    */
   onSendError?: (error: Error) => Error | void;
+
+  /**
+   * Wrap every local application function invoked by the peer. The handler must invoke
+   * `invoke()` synchronously to preserve e-order, and should return its promise so the wrapper
+   * spans the full asynchronous call. The hook is propagated through promise pipelining.
+   */
+  onCall?: RpcCallHandler;
 };
 
 class RpcSessionImpl implements Importer, Exporter {
@@ -753,7 +760,7 @@ class RpcSessionImpl implements Importer, Exporter {
         switch (msg[0]) {
           case "push":  // ["push", Expression]
             if (msg.length > 1) {
-              let payload = new Evaluator(this).evaluate(msg[1]);
+              let payload = new Evaluator(this, this.options.onCall).evaluate(msg[1]);
               let hook = new PayloadStubHook(payload);
 
               // It's possible for a rejection to occur before the client gets a chance to send
@@ -772,7 +779,7 @@ class RpcSessionImpl implements Importer, Exporter {
             // - The export is automatically considered "pulled".
             // - Once the "resolve" is sent, the export is implicitly released.
             if (msg.length > 1) {
-              let payload = new Evaluator(this).evaluate(msg[1]);
+              let payload = new Evaluator(this, this.options.onCall).evaluate(msg[1]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
 

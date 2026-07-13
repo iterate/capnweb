@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook } from "./core.js";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook, type RpcCallHandler } from "./core.js";
 import { webSocketToStreams, makeUpgradeResponse } from "./websocket-streams.js";
 
 export type ImportId = number;
@@ -588,13 +588,13 @@ function streamToBlobPromise(stream: ReadableStream, type: string): RpcPromise {
 // delivery to the app. This is used to implement deserialization, except that it doesn't actually
 // start from a raw string.
 export class Evaluator {
-  constructor(private importer: Importer) {}
+  constructor(private importer: Importer, private callHandler?: RpcCallHandler) {}
 
   private hooks: StubHook[] = [];
   private promises: LocatedPromise[] = [];
 
   public evaluate(value: unknown): RpcPayload {
-    let payload = RpcPayload.forEvaluate(this.hooks, this.promises);
+    let payload = RpcPayload.forEvaluate(this.hooks, this.promises, this.callHandler);
     try {
       payload.value = this.evaluateImpl(value, payload, "value");
       return payload;
@@ -891,7 +891,7 @@ export class Evaluator {
           }
 
           // We need a new evaluator for the args, to build a separate payload.
-          let subEval = new Evaluator(this.importer);
+          let subEval = new Evaluator(this.importer, this.callHandler);
           args = subEval.evaluate([args]);
 
           return addStub(hook.call(path, args));
