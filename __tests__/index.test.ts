@@ -1483,6 +1483,58 @@ describe("capability-passing", () => {
 });
 
 describe("promise pipelining", () => {
+  it("wraps pipelined application calls for their full lifetime", async () => {
+    const gate = Promise.withResolvers<void>();
+    const events: Array<{phase: "start" | "end", path: string, target: string}> = [];
+
+    class ChildTarget extends RpcTarget {
+      async waitForGate(value: string) {
+        await gate.promise;
+        return value;
+      }
+    }
+
+    class RootTarget extends RpcTarget {
+      child() {
+        return new ChildTarget();
+      }
+    }
+
+    await using harness = new TestHarness(
+      new RootTarget(),
+      {
+        onCall: async (info, invoke) => {
+          const event = {
+            path: info.path.join("."),
+            target: (info.target as object).constructor.name,
+          };
+          events.push({phase: "start", ...event});
+          try {
+            return await invoke();
+          } finally {
+            events.push({phase: "end", ...event});
+          }
+        },
+      },
+    );
+
+    using child = harness.stub.child();
+    using pending = child.waitForGate("done");
+    await pumpMicrotasks();
+
+    expect(events).toEqual([
+      {phase: "start", path: "child", target: "RootTarget"},
+      {phase: "end", path: "child", target: "RootTarget"},
+      {phase: "start", path: "waitForGate", target: "ChildTarget"},
+    ]);
+
+    gate.resolve();
+    expect(await pending).toBe("done");
+    expect(events.at(-1)).toEqual(
+      {phase: "end", path: "waitForGate", target: "ChildTarget"},
+    );
+  });
+
   it("supports passing a promise in arguments", async () => {
     await using harness = new TestHarness(new TestTarget());
     let stub = harness.stub;

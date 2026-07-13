@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook } from "./core.js";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook, type RpcCallHandler } from "./core.js";
 import { webSocketToStreams, makeUpgradeResponse } from "./websocket-streams.js";
 
 export type ImportId = number;
@@ -800,7 +800,8 @@ function streamToBlobPromise(stream: ReadableStream, type: string): RpcPromise {
 export class Evaluator {
   private limits: RpcLimits;
 
-  constructor(private importer: Importer, private encodingLevel: EncodingLevel = "string") {
+  constructor(private importer: Importer, private encodingLevel: EncodingLevel = "string",
+              private callHandler?: RpcCallHandler) {
     this.limits = importer.getLimits();
   }
 
@@ -812,7 +813,7 @@ export class Evaluator {
   }
 
   private evaluateWithDepth(value: unknown, depth: number): RpcPayload {
-    let payload = RpcPayload.forEvaluate(this.hooks, this.promises);
+    let payload = RpcPayload.forEvaluate(this.hooks, this.promises, this.callHandler);
     try {
       payload.value = this.evaluateImpl(value, payload, "value", depth);
       return payload;
@@ -1186,7 +1187,7 @@ export class Evaluator {
           }
 
           // We need a new evaluator for the args, to build a separate payload.
-          let subEval = new Evaluator(this.importer);
+          let subEval = new Evaluator(this.importer, this.encodingLevel, this.callHandler);
           args = subEval.evaluateWithDepth([args], depth);
 
           return addStub(hook.call(path, args));
