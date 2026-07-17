@@ -1,4 +1,23 @@
-# Cap'n Web: A JavaScript-native RPC system
+# Cap'n Web (Iterate fork): A JavaScript-native RPC system
+
+> **This is [iterate](https://github.com/iterate)'s public fork of
+> [cloudflare/capnweb](https://github.com/cloudflare/capnweb), published as
+> [`@iterate-com/capnweb`](https://www.npmjs.com/package/@iterate-com/capnweb).**
+>
+> Delta vs upstream 0.8.0:
+> - **WebSocket-over-RPC** — a `Response` with a Workers-style `webSocket`
+>   upgrade can be passed over RPC (tunneled as a stream pair).
+> - **`onCall` session option** — server-side per-call hook for observability
+>   (used by Iterate OS ITX tracing); propagates through promise pipelining.
+> - Small `Provider` type tweak for better go-to-definition through stubs.
+>
+> Consumers that want the import name `capnweb` unchanged can alias:
+> ```json
+> "capnweb": "npm:@iterate-com/capnweb@^0.8.1"
+> ```
+>
+> Continuous PR/main builds: [pkg.pr.new](https://pkg.pr.new) —
+> `https://pkg.pr.new/@iterate-com/capnweb@main`
 
 Cap'n Web is a spiritual sibling to [Cap'n Proto](https://capnproto.org) (and is created by the same author), but designed to play nice in the web stack. That means:
 * Like Cap'n Proto, it is an object-capability protocol. ("Cap'n" is short for "capabilities and".) We'll get into this more below, but it's incredibly powerful.
@@ -18,10 +37,15 @@ Cap'n Web is more expressive than almost every other RPC system, because it impl
 
 ## Installation
 
-[Cap'n Web is an npm package.](https://www.npmjs.com/package/capnweb)
+This fork is published as [`@iterate-com/capnweb`](https://www.npmjs.com/package/@iterate-com/capnweb).
+Upstream remains [`capnweb`](https://www.npmjs.com/package/capnweb).
 
 ```
-npm i capnweb
+# install under the upstream package name (recommended for drop-in use)
+npm i capnweb@npm:@iterate-com/capnweb
+
+# or install under the scoped name and import from '@iterate-com/capnweb'
+npm i @iterate-com/capnweb
 ```
 
 ## Example

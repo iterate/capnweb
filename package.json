@@ -1,10 +1,13 @@
 {
-  "name": "capnweb",
-  "version": "0.8.0",
-  "description": "JavaScript/TypeScript-native RPC library with Promise Pipelining",
+  "name": "@iterate-com/capnweb",
+  "version": "0.8.1",
+  "description": "Iterate fork of capnweb — Cap'n Web RPC with WebSocket-over-RPC and server-side onCall observability",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "author": "Kenton Varda <kenton@cloudflare.com>",
+  "contributors": [
+    "Iterate <https://github.com/iterate>"
+  ],
   "license": "MIT",
   "files": [
     "dist"
@@ -59,10 +62,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/cloudflare/capnweb"
+    "url": "git+https://github.com/iterate/capnweb.git"
   },
   "bugs": {
-    "url": "https://github.com/cloudflare/capnweb/issues"
+    "url": "https://github.com/iterate/capnweb/issues"
   },
-  "homepage": "https://github.com/cloudflare/capnweb#readme"
+  "homepage": "https://github.com/iterate/capnweb#readme"
 }

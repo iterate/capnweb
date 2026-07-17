@@ -1,27 +1,38 @@
-name: Publish to pkg.pr.new for pre-release
-permissions:
-  contents: read
-
+# Continuous preview publishing via https://pkg.pr.new.
+#
+# Every push to main and every PR publishes a tarball to pkg.pr.new's CDN
+# (no npm token involved), installable as:
+#
+#   https://pkg.pr.new/@iterate-com/capnweb@main
+#   https://pkg.pr.new/@iterate-com/capnweb@<sha>
+#   https://pkg.pr.new/@iterate-com/capnweb@<pr>
+#
+# Or, with the full repo path form:
+#
+#   https://pkg.pr.new/iterate/capnweb/@iterate-com/capnweb@main
+#
+# Requires the pkg.pr.new GitHub App on this repo:
+#   https://github.com/apps/pkg-pr-new
+name: pkg.pr.new
 on:
-  pull_request: {}
+  push:
+    branches:
+      - main
+  pull_request:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build packages
-        run: npm run build
-
-      - name: Publish to pkg.pr.new
-        run: npx pkg-pr-new publish
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx pkg-pr-new publish
