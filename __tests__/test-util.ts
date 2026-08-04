@@ -26,7 +26,17 @@ function throwErrorImpl(): never {
   throw new RangeError("test error");
 }
 
+class Servos extends RpcTarget {
+  move({ yaw, pitch }: { yaw: number; pitch: number }) {
+    return { yaw, pitch };
+  }
+}
+
 export class TestTarget extends RpcTarget {
+  get servos() {
+    return new Servos();
+  }
+
   square(i: number) {
     return i * i;
   }
@@ -47,6 +57,15 @@ export class TestTarget extends RpcTarget {
     return new Counter(i);
   }
 
+  async makeDeferredCounter(i: number) {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    return new Counter(i);
+  }
+
+  makeValue(i: number) {
+    return { value: i };
+  }
+
   incrementCounter(c: RpcStub<Counter>, i: number = 1) {
     return c.increment(i);
   }
@@ -61,6 +80,18 @@ export class TestTarget extends RpcTarget {
     }
 
     return result;
+  }
+
+  getBytes() {
+    return Uint8Array.from([0, 1, 2, 127, 128, 254, 255]);
+  }
+
+  getLargeBytes(length: number) {
+    return Uint8Array.from({ length }, (_, index) => index % 251);
+  }
+
+  renderOnScreen({ url }: { url: string }) {
+    return url === "https://example.com/snowman-\u2603?q=\"quoted\"";
   }
 
   returnNull() { return null; }

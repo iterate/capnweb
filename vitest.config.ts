@@ -22,6 +22,8 @@ export default defineConfig({
           // sufficient.
           include: [
             '__tests__/index.test.ts',
+            '__tests__/c-interop.test.ts',
+            '__tests__/c-package.test.ts',
             '__tests__/flow-control.test.ts',
             '__tests__/websocket-tunnel.test.ts',
             '__tests__/limits.test.ts',
