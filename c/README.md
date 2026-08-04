@@ -69,3 +69,9 @@ message cannot be repaired.
 Outbound `push` and `pull` IDs follow Cap'n Web's implicit ordered tables: every
 outbound `push` allocates the next local import ID and the peer allocates the
 matching incoming export ID. A transport must preserve complete-message order.
+
+For high-frequency fire-and-forget traffic,
+`capnweb_session_call_oneway_path()` sends the `push` followed immediately by a
+`release`. It advances the implicit import ID but retains no import slot and
+requests no resolved payload from the peer. Applications must pair it with a
+lower-rate pulled health call when they need remote error reporting.

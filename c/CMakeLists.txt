@@ -45,6 +45,12 @@ if(BUILD_TESTING)
   )
   target_link_libraries(capnweb-session-test PRIVATE capnweb)
   add_test(NAME capnweb-session-test COMMAND capnweb-session-test)
+
+  add_executable(capnweb-oneway-call-test
+    tests/oneway_call_test.c
+  )
+  target_link_libraries(capnweb-oneway-call-test PRIVATE capnweb)
+  add_test(NAME capnweb-oneway-call-test COMMAND capnweb-oneway-call-test)
 endif()
 
 if(CAPNWEB_BUILD_TOOLS)
