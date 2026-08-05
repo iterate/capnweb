@@ -1,13 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(capnweb_c VERSION 0.1.0 LANGUAGES C)
-
-option(CAPNWEB_SANITIZE "Enable address and undefined-behavior sanitizers" OFF)
-option(CAPNWEB_BUILD_TOOLS "Build host-side profiling tools" ON)
-option(CAPNWEB_BUILD_FUZZER "Build the libFuzzer session harness" OFF)
-
-include(CTest)
-
 set(CAPNWEB_SOURCES
   src/call.c
   src/expression.c
@@ -18,6 +10,27 @@ set(CAPNWEB_SOURCES
   src/value.c
   src/writer.c
 )
+
+if(COMMAND idf_component_register)
+  idf_component_register(
+    SRCS ${CAPNWEB_SOURCES}
+    INCLUDE_DIRS include)
+  target_compile_features(${COMPONENT_LIB} PUBLIC c_std_99)
+  target_compile_options(${COMPONENT_LIB} PRIVATE
+    -Wall
+    -Wextra
+    -Werror
+    -Wpedantic)
+  return()
+endif()
+
+project(capnweb_c VERSION 0.1.0 LANGUAGES C)
+
+option(CAPNWEB_SANITIZE "Enable address and undefined-behavior sanitizers" OFF)
+option(CAPNWEB_BUILD_TOOLS "Build host-side profiling tools" ON)
+option(CAPNWEB_BUILD_FUZZER "Build the libFuzzer session harness" OFF)
+
+include(CTest)
 
 add_library(capnweb STATIC ${CAPNWEB_SOURCES})
 target_include_directories(capnweb PUBLIC include)
