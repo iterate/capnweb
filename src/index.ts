@@ -13,6 +13,7 @@ import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
 import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
          newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
 import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
+import { materializeUpgrade, type DeferredWebSocketUpgrade } from "./websocket-streams.js";
 import { forceInitMap } from "./map.js";
 import { forceInitStreams } from "./streams.js";
 
@@ -21,9 +22,10 @@ forceInitStreams();
 
 // Re-export public API types.
 export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
-         nodeHttpBatchRpcResponse, WebSocketTransport, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH };
+         nodeHttpBatchRpcResponse, WebSocketTransport, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH,
+         materializeUpgrade };
 export type { RpcCallInfo, RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport,
-         RpcSessionOptions, RpcCompatible, EncodingLevel, RpcLimits };
+         RpcSessionOptions, RpcCompatible, EncodingLevel, RpcLimits, DeferredWebSocketUpgrade };
 
 // Hack the type system to make RpcStub's types work nicely!
 /**

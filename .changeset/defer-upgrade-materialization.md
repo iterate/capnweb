@@ -1,0 +1,7 @@
+---
+"@iterate-com/capnweb": minor
+---
+
+Tunneled WebSocket upgrade Responses now arrive in forwardable form by default on Cloudflare Workers: `Response.webSocket` deserializes to an opaque `DeferredWebSocketUpgrade` — a `{ readable, writable, init }` byte-stream pair — instead of an eagerly materialized `WebSocketPair` end. The pair can be carried across hops that serialize byte streams but not sockets (in particular native Workers RPC between isolates, whose serializer refuses a live WebSocket), and the new `materializeUpgrade(pair, init?)` export rebuilds a real upgrade `Response` at the hop that actually serves it; `pair.init` carries the provider's upgrade headers (e.g. a negotiated `Sec-WebSocket-Protocol`) so they survive to the served 101. On other runtimes the previous behavior (a usable `TunneledWebSocket`) remains the default. The new `deferUpgradeMaterialization` session option overrides the default in either direction — set it to `false` on Workers to restore eager materialization when the session endpoint itself serves the upgrade. Receive-side only: the wire format is unchanged.
+
+Behavior change on Workers only: code that received a tunneled upgrade over a capnweb session on workerd and used `response.webSocket` as a native socket at the session endpoint must either call `materializeUpgrade(response.webSocket)` or set `deferUpgradeMaterialization: false` on the session.
