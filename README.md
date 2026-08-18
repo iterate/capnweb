@@ -7,6 +7,12 @@
 > Delta vs upstream:
 > - **WebSocket-over-RPC** — a `Response` with a Workers-style `webSocket`
 >   upgrade can be passed over RPC (tunneled as a stream pair).
+> - **Deferred upgrade materialization** — on Cloudflare Workers a tunneled
+>   upgrade arrives by default as an opaque byte-stream pair that can cross
+>   hops which serialize byte streams but not sockets (e.g. native Workers
+>   RPC between isolates); `materializeUpgrade()` rebuilds the real socket at
+>   the hop that serves it. The `deferUpgradeMaterialization` session option
+>   overrides the default in either direction.
 > - **`onCall` session option** — server-side per-call hook for observability
 >   (used by Iterate OS ITX tracing); propagates through promise pipelining.
 > - Small `Provider` type tweak for better go-to-definition through stubs.

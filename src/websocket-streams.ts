@@ -371,6 +371,341 @@ export function makeUpgradeResponse(
   }
 }
 
+// =======================================================================================
+// Deferred materialization
+//
+// A deferring session -- the default on Cloudflare Workers, or any session with the
+// `deferUpgradeMaterialization` option set -- delivers an upgrade Response's tunneled socket as
+// an opaque `{ readable, writable, init }` byte pair (the DeferredWebSocketUpgrade below)
+// instead of materializing a socket, so that infrastructure code can carry the tunnel across
+// further hops before materializeUpgrade() turns it back into a real socket at the hop that
+// serves it.
+//
+// The pair is BYTE-oriented (chunks are Uint8Arrays): the boundaries the pair exists to cross
+// -- in particular native Cloudflare Workers RPC between isolates -- proxy only byte streams,
+// refusing streams of arbitrary values. So the tunnel's frames are wrapped in a
+// length-prefixed encoding: 1 byte frame type (0 text, 1 binary, 2 close), 4 bytes big-endian
+// payload length, then the payload (UTF-8 text, raw bytes, or `{"code","reason"}` JSON
+// respectively).
+//
+// Although the encoding never appears on a Cap'n Web session's own wire, it IS a persistent
+// cross-deployment format: the deferring worker and the worker that materializes are deployed
+// independently and can run different versions of this library during a rollout. The header
+// layout (1-byte type + 4-byte big-endian length) is therefore frozen, and evolution is
+// append-only: new frame types may be added, and a decoder that meets an unknown type fails
+// loudly (tearing the tunnel down) rather than desynchronizing. Apps must still treat the pair
+// as opaque -- the encoding is a contract between two versions of this library, not an API.
+//
+// The pair inherits the tunnel's flow control end to end: stream acks fire as the pair is
+// read, so an in-transit or unconsumed pair keeps the provider throttled to the flow-control
+// window, and a deferring receiver pools at most a window's worth of chunks. Once
+// materialized, the endpoint behaves like a non-deferred one: messages are dispatched as they
+// arrive, and a slow final consumer is absorbed by the native socket's send buffer, as on a
+// direct WebSocket.
+
+// The runtime default when a session doesn't set `deferUpgradeMaterialization` explicitly:
+// defer on Cloudflare Workers, where a socket materialized at the session endpoint could never
+// cross another RPC hop anyway (and the serving isolate rebuilds it with materializeUpgrade());
+// materialize elsewhere, where there are no internal RPC hops to worry about and the app wants
+// a usable socket directly.
+export function deferUpgradesByDefault(): boolean {
+  return typeof WebSocketPair !== "undefined";
+}
+
+const FRAME_TEXT = 0, FRAME_BINARY = 1, FRAME_CLOSE = 2;
+
+// Far above any message a supported transport delivers (Workers caps incoming WebSocket
+// messages at 1 MiB; `ws` defaults to 100 MiB), this bounds what a corrupt length header can
+// make the decoder buffer. Exceeding it tears the tunnel down.
+const MAX_FRAME_LENGTH = 128 * 1024 * 1024;
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+function encodeFrame(chunk: unknown): Uint8Array {
+  let type: number, payload: Uint8Array;
+  if (isCloseRecord(chunk)) {
+    type = FRAME_CLOSE;
+    payload = textEncoder.encode(
+        JSON.stringify({ code: chunk.close.code, reason: chunk.close.reason }));
+  } else {
+    let data = toStringOrBytes(chunk);
+    if (typeof data === "string") {
+      type = FRAME_TEXT;
+      payload = textEncoder.encode(data);
+    } else {
+      type = FRAME_BINARY;
+      payload = data;
+    }
+  }
+  if (payload.length > MAX_FRAME_LENGTH) {
+    // Enforced on both sides: failing here attributes the error at the offending send instead
+    // of at the far end's decoder.
+    throw new TypeError(`WebSocket tunnel frame of ${payload.length} bytes exceeds the maximum.`);
+  }
+  let frame = new Uint8Array(5 + payload.length);
+  frame[0] = type;
+  new DataView(frame.buffer).setUint32(1, payload.length);
+  frame.set(payload, 5);
+  return frame;
+}
+
+// Decodes frames from a byte stream that may be re-chunked at arbitrary boundaries in transit.
+class FrameDecoder {
+  // Bytes of the frame in progress, kept as a chunk list with a running total so a frame
+  // delivered in many pieces is assembled once when complete, not re-copied on every push.
+  // Invariant: the buffered bytes always begin at a frame boundary.
+  #chunks: Uint8Array[] = [];
+  #size = 0;
+
+  // A partial frame is buffered; end-of-stream in this state means truncation, not a clean end.
+  get hasPartialFrame(): boolean {
+    return this.#size > 0;
+  }
+
+  push(bytes: Uint8Array): unknown[] {
+    if (bytes.length > 0) {
+      this.#chunks.push(bytes);
+      this.#size += bytes.length;
+    }
+
+    let frames: unknown[] = [];
+    while (this.#size >= 5) {
+      let header = this.#peek(5);
+      let length = new DataView(header.buffer, header.byteOffset).getUint32(1);
+      if (length > MAX_FRAME_LENGTH) {
+        throw new TypeError(`WebSocket tunnel frame of ${length} bytes exceeds the maximum.`);
+      }
+      if (this.#size < 5 + length) break;
+
+      let frame = this.#take(5 + length);
+      let payload = frame.subarray(5);
+      switch (frame[0]) {
+        case FRAME_TEXT:
+          frames.push(textDecoder.decode(payload));
+          break;
+        case FRAME_BINARY:
+          // Copy: the payload may be a view into a caller's chunk.
+          frames.push(payload.slice());
+          break;
+        case FRAME_CLOSE: {
+          let { code, reason } = JSON.parse(textDecoder.decode(payload));
+          frames.push({ close: {
+            code: typeof code === "number" ? code : 1005,
+            reason: typeof reason === "string" ? reason : "",
+          } });
+          break;
+        }
+        default:
+          throw new TypeError(`Unknown tunnel frame type: ${frame[0]}`);
+      }
+    }
+    return frames;
+  }
+
+  // A view whose first n bytes are the first n buffered bytes, without consuming them. May be
+  // longer than n (the fast path returns the whole first chunk). Requires n <= #size.
+  #peek(n: number): Uint8Array {
+    if (this.#chunks[0].length >= n) return this.#chunks[0];
+    let out = new Uint8Array(n);
+    let pos = 0;
+    for (let chunk of this.#chunks) {
+      let take = Math.min(n - pos, chunk.length);
+      out.set(chunk.subarray(0, take), pos);
+      pos += take;
+      if (pos === n) break;
+    }
+    return out;
+  }
+
+  // Removes the first n buffered bytes and returns them contiguously.
+  #take(n: number): Uint8Array {
+    this.#size -= n;
+    let first = this.#chunks[0];
+    if (first.length === n) {
+      return this.#chunks.shift()!;
+    } else if (first.length > n) {
+      this.#chunks[0] = first.subarray(n);
+      return first.subarray(0, n);
+    }
+    let out = new Uint8Array(n);
+    let pos = 0;
+    while (pos < n) {
+      let chunk = this.#chunks[0];
+      let take = Math.min(n - pos, chunk.length);
+      out.set(chunk.subarray(0, take), pos);
+      pos += take;
+      if (take === chunk.length) this.#chunks.shift();
+      else this.#chunks[0] = chunk.subarray(take);
+    }
+    return out;
+  }
+}
+
+function coerceBytes(chunk: unknown): Uint8Array {
+  let bytes = toStringOrBytes(chunk);
+  if (typeof bytes === "string") {
+    throw new TypeError("Expected bytes on a deferred tunnel stream, got a string.");
+  }
+  return bytes;
+}
+
+// A ReadableStream whose chunks are `getReader()`'s chunks mapped through `transform`, which
+// may yield zero or more output chunks per input (a decoder can need more bytes; one byte chunk
+// can hold several frames). Built with highWaterMark 0 and a lazy reader thunk so the inner
+// stream is locked only when a consumer actually reads: an untouched deferred Response's inner
+// streams stay payload-owned and are released on disposal, like an unclaimed TunneledWebSocket.
+// (A TransformStream can't do this: pipeThrough locks the inner stream immediately, and the
+// default highWaterMark of 1 would pull -- and lock -- at construction time.) `flush` runs at
+// end-of-stream; it can throw to turn a truncated stream into an error instead of a clean end.
+function transformReadable(getReader: () => ReadableStreamDefaultReader,
+    transform: (chunk: unknown) => unknown[], flush?: () => void): ReadableStream {
+  let reader: ReadableStreamDefaultReader | undefined;
+  return new ReadableStream({
+    async pull(controller) {
+      reader ??= getReader();
+      // Loop until we enqueue something (or end): a transform can consume a chunk without
+      // producing output (a decoder mid-frame), and the stream machinery only re-invokes
+      // pull() after an enqueue -- returning empty-handed would strand the pending read.
+      while (true) {
+        let { done, value } = await reader.read();
+        if (done) {
+          flush?.();
+          controller.close();
+          return;
+        }
+        let chunks = transform(value);
+        if (chunks.length > 0) {
+          for (let chunk of chunks) {
+            controller.enqueue(chunk);
+          }
+          return;
+        }
+      }
+    },
+    cancel(reason) {
+      reader ??= getReader();
+      return reader.cancel(reason);
+    },
+  }, { highWaterMark: 0 });
+}
+
+// The WritableStream counterpart: transforms each incoming chunk and forwards the results to
+// the writer, acquired lazily on first use. A transform or flush error means the tunnel's
+// framing is broken, so fail closed: abort the inner writable (tearing down the sender's
+// socket) rather than leaving it half-open.
+function transformWritable(getWriter: () => WritableStreamDefaultWriter,
+    transform: (chunk: unknown) => unknown[], flush?: () => void): WritableStream {
+  let writer: WritableStreamDefaultWriter | undefined;
+  return new WritableStream({
+    async write(chunk) {
+      writer ??= getWriter();
+      try {
+        for (let out of transform(chunk)) {
+          await writer.write(out);
+        }
+      } catch (err) {
+        writer.abort(err).catch(() => {});
+        throw err;
+      }
+    },
+    close() {
+      writer ??= getWriter();
+      try {
+        flush?.();
+      } catch (err) {
+        writer.abort(err).catch(() => {});
+        throw err;
+      }
+      return writer.close();
+    },
+    abort(reason) {
+      writer ??= getWriter();
+      return writer.abort(reason);
+    },
+  });
+}
+
+// The opaque pair a deferring session delivers as `Response.webSocket`. `init` carries the
+// provider's upgrade ResponseInit (notably negotiated headers such as Sec-WebSocket-Protocol);
+// it is plain data, so infrastructure that forwards the whole pair object across a hop
+// preserves the headers for materializeUpgrade() automatically.
+export interface DeferredWebSocketUpgrade {
+  readable: ReadableStream;
+  writable: WritableStream;
+  init?: ResponseInit;
+}
+
+// Builds the Response a deferring session delivers: the tunnel's value streams wrapped into the
+// opaque framed-byte pair. The readable encodes the tunnel's chunks into framed bytes; the
+// writable decodes framed bytes and forwards the frames to the sender's WritableStream hook.
+// Both inner ends stay owned by the containing payload, exactly like a ReadableStream and
+// WritableStream received over RPC as plain values, and are only locked when the pair is used.
+export function makeDeferredUpgradeResponse(
+    readable: ReadableStream, writableHook: StubHook, init: ResponseInit): Response {
+  let decoder = new FrameDecoder();
+  let webSocket: DeferredWebSocketUpgrade = {
+    readable: transformReadable(() => readable.getReader(), chunk => [encodeFrame(chunk)]),
+    writable: transformWritable(
+        () => streamImpl.createWritableStreamFromHook(writableHook).getWriter(),
+        bytes => decoder.push(coerceBytes(bytes)),
+        () => {
+          if (decoder.hasPartialFrame) {
+            throw new Error("WebSocket tunnel closed with a truncated frame.");
+          }
+        }),
+    init,
+  };
+  let response = new Response(null, init);
+  Object.defineProperty(response, "webSocket", { value: webSocket, configurable: true });
+  return response;
+}
+
+// Turns a tunneled socket's deferred byte pair -- as delivered by a deferring session -- back
+// into a real upgrade Response. This is the
+// counterpart the final hop calls: infrastructure code forwards the pair across boundaries
+// that can serialize byte streams but not sockets (e.g. Cloudflare Workers RPC between
+// isolates), then materializes the socket exactly once, where the 101 is actually returned to
+// the client.
+//
+// The provider's upgrade headers ride on `webSocket.init`; an explicit `init` argument
+// replaces it wholesale (merge the provider's headers in yourself if you want both). Reserved
+// handshake headers that ride along (Connection, Upgrade, Sec-WebSocket-Accept/-Key/-Version,
+// Content-Length, ...) are recomputed or dropped by the runtime when the Response completes a
+// real upgrade, so only non-reserved headers such as Sec-WebSocket-Protocol reach the wire;
+// callers on in-process hops (service bindings) see init's headers verbatim.
+//
+// The pair is consumed: both streams are locked synchronously, so a second
+// materializeUpgrade() of the same pair throws instead of corrupting the first. On Workers the
+// result is pumped by in-memory listeners, so a live materialized tunnel keeps its isolate (or
+// Durable Object) resident for the socket's lifetime.
+export function materializeUpgrade(
+    webSocket: DeferredWebSocketUpgrade, init?: ResponseInit): Response {
+  let reader = webSocket.readable.getReader();
+  let writer: WritableStreamDefaultWriter;
+  try {
+    writer = webSocket.writable.getWriter();
+  } catch (err) {
+    reader.releaseLock();
+    throw err;
+  }
+
+  // The inverse wrappers of makeDeferredUpgradeResponse's, with the write direction wrapped in
+  // a local WritableStream hook so the socket manages it exactly as it manages a hook received
+  // over RPC.
+  let decoder = new FrameDecoder();
+  let readable = transformReadable(() => reader,
+      bytes => decoder.push(coerceBytes(bytes)),
+      () => {
+        if (decoder.hasPartialFrame) {
+          throw new Error("WebSocket tunnel ended with a truncated frame.");
+        }
+      });
+  let writableHook = streamImpl.createWritableStreamHook(
+      transformWritable(() => writer, chunk => [encodeFrame(chunk)]));
+  return makeUpgradeResponse(readable, writableHook, init ?? webSocket.init ?? {});
+}
+
 // Forward messages and closure between a native WebSocket (one end of a WebSocketPair) and a
 // tunneled socket, in both directions.
 //

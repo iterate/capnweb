@@ -3,7 +3,8 @@
 //     https://opensource.org/license/mit
 
 import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook, type RpcCallHandler } from "./core.js";
-import { webSocketToStreams, makeUpgradeResponse } from "./websocket-streams.js";
+import { webSocketToStreams, makeUpgradeResponse, makeDeferredUpgradeResponse,
+         deferUpgradesByDefault } from "./websocket-streams.js";
 
 export type ImportId = number;
 export type ExportId = number;
@@ -745,6 +746,14 @@ export interface Importer {
   // Importer (rather than the Evaluator constructor) so that the per-session options reach the
   // Evaluator without changing how Evaluators are constructed throughout the codebase.
   getLimits(): RpcLimits;
+
+  // The session's explicit `deferUpgradeMaterialization` setting, or undefined to use the
+  // runtime default (deferred on Cloudflare Workers, materialized elsewhere -- see
+  // RpcSessionOptions). Like getLimits(), surfaced through the Importer so the per-session
+  // option reaches the Evaluator at every construction site -- but optional, since only a real
+  // RPC session can meaningfully answer it (an importer that can't receive an upgrade Response
+  // at all simply doesn't implement it).
+  deferUpgradeMaterialization?(): boolean | undefined;
 }
 
 class NullImporter implements Importer {
@@ -1101,6 +1110,15 @@ export class Evaluator {
             this.hooks.push(writableHook);
 
             delete init.webSocket;
+
+            if (this.importer.deferUpgradeMaterialization?.() ?? deferUpgradesByDefault()) {
+              // Deliver the tunnel in forwardable form (the default on Workers, where an
+              // eagerly materialized socket could never cross another RPC hop anyway; a
+              // serving endpoint rebuilds the socket with materializeUpgrade()). See
+              // "Deferred materialization" in websocket-streams.ts.
+              return makeDeferredUpgradeResponse(readable, writableHook, init as ResponseInit);
+            }
+
             return makeUpgradeResponse(readable, writableHook, init as ResponseInit);
           }
 

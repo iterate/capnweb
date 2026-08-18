@@ -467,6 +467,46 @@ export type RpcSessionOptions = {
    * spans the full asynchronous call. The hook is propagated through promise pipelining.
    */
   onCall?: RpcCallHandler;
+
+  /**
+   * Controls what a tunneled WebSocket upgrade Response's `webSocket` property deserializes to
+   * on this session: `true` delivers the opaque `{ readable, writable, init }` byte-stream
+   * pair (`DeferredWebSocketUpgrade`), `false` a materialized socket (a native WebSocketPair
+   * end on Cloudflare Workers, a TunneledWebSocket elsewhere).
+   *
+   * Unset, the runtime picks the shape that can actually be used there: **deferred on
+   * Cloudflare Workers** -- where a socket materialized at the session endpoint could never
+   * cross another RPC hop, the exact mistake behind
+   * `DataCloneError: Could not serialize object of type "WebSocket"` -- and **materialized
+   * everywhere else**, where there are no internal hops and the app wants a socket directly.
+   * Set `false` on Workers only when the session endpoint itself serves the upgrade and wants
+   * `response.webSocket` to be a native socket without calling `materializeUpgrade()`.
+   *
+   * The deferred pair exists to be carried across hops that serialize byte streams but not
+   * sockets -- e.g. a Workers RPC boundary between isolates -- and rebuilt into a real upgrade
+   * Response with `materializeUpgrade()` at the hop that serves it. Forward the whole pair
+   * object: `init` carries the provider's upgrade headers (e.g. a negotiated
+   * Sec-WebSocket-Protocol) so the materialized 101 can echo them. The deferred Response
+   * itself has status 200 (a constructed Response can't be 1xx) -- detect an upgrade by
+   * `response.webSocket != null`, never by status -- and must not be forwarded across a native
+   * boundary: its `webSocket` property is a local JS extension and silently disappears,
+   * leaving an ordinary-looking 200.
+   *
+   * The pair's inner ends follow the ordinary ownership semantics of streams received over
+   * RPC: they belong to the containing payload for the tunnel's whole life -- first use locks
+   * them but takes no ownership -- and disposing the payload releases the tunnel and closes
+   * the socket. So a pair received in call *params* cannot be kept past the call (there is no
+   * analog of TunneledWebSocket's accept()): finish forwarding it before returning, or receive
+   * the pair as a call *result* instead. The awaited result carries the payload; keep the
+   * delivering Response undisposed for as long as the tunnel is in use (undisposed results
+   * live until the session ends). Infrastructure that needs to reclaim per-tunnel state before
+   * then can wrap the pair's streams in observing pass-throughs before forwarding, or tie
+   * retention to whatever connection delivered the pair onward.
+   *
+   * Purely a receive-side choice: the wire format is unchanged, the sending side needs no
+   * corresponding option, and either side may run an older version.
+   */
+  deferUpgradeMaterialization?: boolean;
 };
 
 class RpcSessionImpl implements Importer, Exporter {
@@ -714,6 +754,10 @@ class RpcSessionImpl implements Importer, Exporter {
 
   getLimits(): RpcLimits {
     return this.limits;
+  }
+
+  deferUpgradeMaterialization(): boolean | undefined {
+    return this.options.deferUpgradeMaterialization;
   }
 
   createPipe(readable: ReadableStream, readableHook: StubHook): ImportId {
