@@ -1572,8 +1572,11 @@ export class RpcPayload {
             // (including a WebSocketPair half, the idiomatic thing to find here) refuses
             // close() before accept(), and accepting a socket we're about to throw away is
             // harmless everywhere -- ws/browser sockets have no accept(), and for a tunneled
-            // socket accept() merely claims it.
-            try { (webSocket as any).accept?.(); webSocket.close(); } catch {}
+            // socket accept() merely claims it. Separate try blocks: some Workers sockets
+            // refuse accept() while still honoring close() (constructor-obtained clients,
+            // hibernation-adopted sockets), and an accept() throw must never veto the close.
+            try { (webSocket as any).accept?.(); } catch {}
+            try { webSocket.close(); } catch {}
           }
         }
         return;

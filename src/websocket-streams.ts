@@ -160,8 +160,11 @@ export function webSocketToStreams(socket: WebSocketLike)
         // leave the tunnel's other end hanging forever. For passthrough sockets this means the
         // echoed close carries the tunnel client's own code rather than the far server's
         // eventual ack, which is deliberate: the closeSocket() above still forwards the real
-        // code to the far server. (Frames already enqueued in the readable stay ordered ahead
-        // of the echoed close; `closed` dedupes any real close event that arrives later.)
+        // code to the far server. Frames the socket delivers AFTER this point are discarded --
+        // the tunnel deliberately does not implement half-close, so a tunnel-initiated close
+        // cuts off in-flight server frames (as a browser client's close() does). (Frames
+        // already enqueued in the readable stay ordered ahead of the echoed close; `closed`
+        // dedupes any real close event that arrives later.)
         if (!closed) {
           closed = true;
           try {
@@ -646,13 +649,6 @@ class JsWebSocketHalf {
     this.#peer.#deliver({ type: "close", code: code ?? 1005, reason: reason ?? "" });
   }
 
-  [Symbol.dispose](): void {
-    // Disposal must release the half even if it was never accepted (close() before accept()
-    // throws, like workerd's); accepting a half we're throwing away is harmless.
-    this.accept();
-    this.close();
-  }
-
   addEventListener(type: string, listener: Listener, options?: { once?: boolean }): void {
     let list = this.#listeners.get(type);
     if (!list) {
@@ -774,7 +770,9 @@ type WebSocketPairHalf = {
  * without bound until its accept() is called, delivery always asynchronous, and RFC 6455
  * half-close: a half that close()s can no longer send but KEEPS RECEIVING until its peer
  * closes back, and both halves reach CLOSED only once both have closed. A half never hears a
- * close event for its own close().
+ * close event for its own close(). (The KEEPS-RECEIVING window exists between the two halves
+ * only -- the RPC tunnel itself does not implement half-close, so frames sent after a
+ * tunnel-initiated close do not reach the tunnel's other end.)
  *
  * The pure-JS pair diverges from native workerd in exactly four deliberate ways:
  *
