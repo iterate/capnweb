@@ -2707,6 +2707,20 @@ describe("WebSockets", () => {
       async [Symbol.asyncDispose]() { stub[Symbol.dispose](); },
     };
   });
+
+  // Regression: the server stores a bare client callback and invokes it *later*, in a separate
+  // call (the "subscription delivery" shape used by live-state clients). The later invocation calls
+  // the stub as a bare function -- an empty property path. This runs in every browser too (the
+  // WebSockets battery is included by all browser projects), guarding delivery of a bare callback
+  // to a browser client, which is exactly how Iterate's live-state subscriptions are served.
+  it("delivers to a bare callback stored and invoked in a later call (empty path)", async () => {
+    using stub = newWebSocketRpcSession<TestTarget>(`ws://${inject("testServerHost")}`);
+    let got: number | undefined;
+    await stub.subscribeCallback((v: number) => { got = v; return v * 10; });
+    let result = await stub.notifySubscriber(7);
+    expect(result).toStrictEqual({ result: 70 });
+    expect(got).toBe(7);
+  });
 });
 
 describe("MessagePorts", () => {

@@ -1,5 +1,20 @@
 # capnweb
 
+## 0.12.1
+
+### Patch Changes
+
+- Fork discipline: reverted an accidental `Provider<T>` type change (a `Pick<>` reshaping added
+  only for go-to-definition ergonomics) so the fork's published `.d.ts` matches upstream 0.12.0
+  exactly. No behavioral or type-semantics change. The fork's remaining source diff vs upstream is
+  now exactly its two intentional features: WebSocket-over-RPC (`src/websocket-streams.ts` +
+  `Response.webSocket` (de)serialization) and the server-side `onCall` per-call hook.
+
+- Added a browser regression test (`__tests__/index.test.ts`, in the WebSockets group that runs on
+  every browser) proving a server can deliver to a bare client callback that it stored and invoked
+  in a later call (the empty-path "subscription delivery" shape). Passes on Chromium, Firefox, and
+  WebKit as well as Node and workerd — i.e. bare-callback delivery to a browser client works.
+
 ## 0.12.0
 
 ### Minor Changes

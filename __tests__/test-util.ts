@@ -39,6 +39,21 @@ export class TestTarget extends RpcTarget {
     return { result: await func(i) };
   }
 
+  // Store a bare callback now and invoke it later, in a *separate* call -- the "subscription
+  // delivery" shape (mirrors the workerd TestDo.subscribe/notify). `dup()` keeps the stub alive
+  // past the call it arrived in. The later invocation calls the stub as a bare function (empty
+  // path).
+  #subscriber?: RpcStub<(v: number) => unknown>;
+  subscribeCallback(callback: RpcStub<(v: number) => unknown>) {
+    this.#subscriber = (callback as unknown as { dup(): RpcStub<(v: number) => unknown> }).dup();
+  }
+  async notifySubscriber(value: number) {
+    let result = await this.#subscriber!(value);
+    (this.#subscriber as unknown as Disposable)[Symbol.dispose]();
+    this.#subscriber = undefined;
+    return { result };
+  }
+
   throwError() {
     throwErrorImpl();
   }

@@ -282,21 +282,18 @@ type TupleProvider<T extends ReadonlyArray<unknown>> = {
 
 // Base type for all other types providing RPC-like interfaces.
 // Rewrites all methods/properties to be `MethodOrProperty`s, while preserving callable types.
-//
 // `__RPC_TARGET_BRAND` deliberately flows through the key mapping (as a `never` property) so
 // stubs of branded targets stay assignable to workers-types' `Stubable`. Such stubs match our
 // `Stubable` too — harmless, since all machinery checks `StubBase` before `Stubable`.
-//
-// Use `Pick<{[K in keyof T]: ...}, Exclude<...>>` rather than a direct mapped type over the
-// filtered keys so TypeScript keeps a named `T` in the type tree (better go-to-definition /
-// cmd-click through RpcStub/Provider wrappers).
 export type Provider<T> = MaybeCallableProvider<T> &
   (T extends ReadonlyArray<unknown>
     ? number extends T["length"] ? ArrayProvider<T[number]> : TupleProvider<T>
-    : Pick<
-        { [K in keyof T]: MethodOrProperty<T[K]> },
-        Exclude<keyof T, symbol | keyof StubBase<never>>
-      > & {
+    : {
+        [K in Exclude<
+          keyof T,
+          symbol | keyof StubBase<never>
+        >]: MethodOrProperty<T[K]>;
+      } & {
         map<V>(
           callback: (value: MapCallbackValue<NonNullable<T>>) => MapCallbackReturn<V>
         ): Result<Array<V>>;
