@@ -8,7 +8,8 @@ import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget, env, DurableObj
 // Cap'n Web's WebSocketPair export is imported under an alias so that the bare `WebSocketPair`
 // references in the tests below keep pinning the raw native global spelling.
 import { newHttpBatchRpcSession, newWebSocketRpcSession, RpcStub, RpcPromise, RpcTarget,
-         WebSocketPair as CapnwebWebSocketPair } from "../src/index-workers.js";
+         upgradeWebSocketResponse, WebSocketPair as CapnwebWebSocketPair }
+    from "../src/index-workers.js";
 import { v, wrapServerTarget, type ServiceValidator } from "../packages/capnweb-validate/src/internal/core.js";
 import { Counter, DeviceEchoTarget, TestTarget } from "./test-util.js";
 
@@ -366,7 +367,74 @@ describe("workerd RPC server", () => {
     });
     socket!.send("hello");
     expect(await message).toBe("device-echo:hello");
+
+    // The close round trip -- the same assertions as the Node twin (websocket-tunnel.test.ts).
+    // The tunnel edge completes a client-initiated close by echoing the close record back;
+    // before that fix, this close event never fired on workerd and the socket hung at CLOSING
+    // forever. The receive path relays the echo onto the native pair backing this socket, so
+    // the client hears its own code/reason back, exactly like the Node client does.
+    let closeEvent = new Promise<any>(resolve => {
+      socket!.addEventListener("close", event => resolve(event), { once: true });
+    });
     socket!.close(1000, "done");
+    let event = await closeEvent;
+    expect(event.code).toBe(1000);
+    expect(event.reason).toBe("done");
+    // The half reads CLOSED once its close event has dispatched.
+    for (let i = 0; i < 100 && socket!.readyState !== 3; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(socket!.readyState).toBe(3);  // CLOSED
+  });
+
+  it("builds a genuine 101 Response carrying the given native socket, without any RPC", () => {
+    // Directly pins the docstring's flagship claim -- on Workers, upgradeWebSocketResponse()
+    // produces exactly the native `new Response(null, { status: 101, webSocket })`, suitable
+    // for completing a real HTTP upgrade. This can't be proven through an RPC round trip: the
+    // receive path always rebuilds a native 101 regardless of what the sender constructed, so
+    // only a direct look at the constructed Response pins the platform branch.
+    let pair = new WebSocketPair();
+    let response = upgradeWebSocketResponse(pair[0]);
+    expect(response.status).toBe(101);
+    expect(response.webSocket).toBe(pair[0]);
+  });
+
+  it("closes the provider's kept half when a returned Response is never touched", async () => {
+    // The workerd twin of the Node release-on-ignore test: when the caller never pulls the
+    // answer, disposeImpl's accept-then-close of the unsent half must notify the kept half on
+    // the native pair too. (close() before accept() throws on workerd, which is exactly why
+    // disposeImpl accepts first.)
+    class PairIgnoredTarget extends RpcTarget {
+      pairCloseEvent?: Promise<any>;
+      openPairIgnored(): Response {
+        let pair = new WebSocketPair();
+        pair[1].accept();
+        this.pairCloseEvent = new Promise(resolve => {
+          pair[1].addEventListener("close", event => resolve(event), { once: true });
+        });
+        return upgradeWebSocketResponse(pair[0]);
+      }
+      pairOpened(): boolean {
+        return this.pairCloseEvent !== undefined;
+      }
+      async waitForPairClose(): Promise<unknown> {
+        let event: any = await this.pairCloseEvent;
+        return { code: event.code, reason: event.reason };
+      }
+    }
+
+    let pair = new WebSocketPair();
+    pair[0].accept();
+    pair[1].accept();
+    let api: any = newWebSocketRpcSession(pair[0]);
+    newWebSocketRpcSession(pair[1], new PairIgnoredTarget());
+
+    let promise = api.openPairIgnored();
+    // In-order delivery: a second, awaited call proves the first executed server-side before
+    // we release its never-pulled answer.
+    expect(await api.pairOpened()).toBe(true);
+    promise[Symbol.dispose]();
+    expect(await api.waitForPairClose()).toMatchObject({ code: 1005 });
   });
 
   it("can accept WebSocket RPC connections", async () => {

@@ -112,7 +112,12 @@ describe("WebSocket upgrade responses over RPC", () => {
       let local = new NodeWebSocket(`ws://127.0.0.1:${this.speakFirstPort}`);
       let pair = new WebSocketPair();
       pair[1].accept();
-      local.addEventListener("message", (event: any) => pair[1].send(event.data));
+      let greetingRelayed!: (value: void) => void;
+      let greetingArrived = new Promise<void>(resolve => { greetingRelayed = resolve; });
+      local.addEventListener("message", (event: any) => {
+        pair[1].send(event.data);
+        greetingRelayed();
+      });
       local.addEventListener("close", (event: any) => {
         try { pair[1].close(event.code, event.reason); } catch { pair[1].close(); }
       });
@@ -125,6 +130,10 @@ describe("WebSocket upgrade responses over RPC", () => {
         local.addEventListener("error", () => reject(new Error("local dial failed")),
                                { once: true });
       });
+      // Force the race the test exists to pin: only answer once the greeting has demonstrably
+      // been relayed into the pair, so it always precedes the Response's serialization and only
+      // the pair's pre-listener buffering can save it.
+      await greetingArrived;
       return upgradeWebSocketResponse(pair[0]);
     }
 
@@ -356,6 +365,9 @@ describe("WebSocket upgrade responses over RPC", () => {
       // Thrown synchronously, while serializing the call, just like the raw-socket case above.
       expect(() => api.relay(response, response)).toThrow(/only be sent over RPC once/);
     } finally {
+      // (accept() first in case serialization never got far enough to accept the half itself;
+      // close() before accept() throws, as on workerd.)
+      pair[0].accept();
       pair[0].close();
     }
   });

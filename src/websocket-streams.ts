@@ -109,9 +109,11 @@ export function webSocketToStreams(socket: WebSocketLike)
   try { socket.binaryType = "arraybuffer"; } catch {}
 
   let closed = false;
+  let readableController!: ReadableStreamDefaultController;
 
   let readable = new ReadableStream({
     start(controller) {
+      readableController = controller;
       socket.addEventListener("message", (event: any) => {
         if (closed) return;
         try {
@@ -150,6 +152,24 @@ export function webSocketToStreams(socket: WebSocketLike)
     write(chunk) {
       if (isCloseRecord(chunk)) {
         closeSocket(socket, chunk.close.code, chunk.close.reason);
+
+        // A close arriving down the tunnel is completed here, at this edge, by echoing the
+        // final close record back into the readable. We can't wait for the socket's own close
+        // event instead: a WebSocket never fires a close event for its *own* close() -- a
+        // native pair half parks at CLOSING until its peer closes back -- so waiting would
+        // leave the tunnel's other end hanging forever. For passthrough sockets this means the
+        // echoed close carries the tunnel client's own code rather than the far server's
+        // eventual ack, which is deliberate: the closeSocket() above still forwards the real
+        // code to the far server. (Frames already enqueued in the readable stay ordered ahead
+        // of the echoed close; `closed` dedupes any real close event that arrives later.)
+        if (!closed) {
+          closed = true;
+          try {
+            readableController.enqueue(
+                { close: { code: chunk.close.code, reason: chunk.close.reason } });
+            readableController.close();
+          } catch {}
+        }
       } else {
         socket.send(toStringOrBytes(chunk));
       }
@@ -241,8 +261,8 @@ export class TunneledWebSocket {
     this.#claim();
     this.#readyState = TunneledWebSocket.CLOSING;
 
-    // Closing the sender's socket makes its close event come back through the readable,
-    // completing the close.
+    // The close record closes the sender's socket, and the sender's edge echoes the record back
+    // through the readable (see webSocketToStreams), which is what completes the close here.
     if (this.#writer) {
       this.#write({ close: { code: code ?? 1005, reason: reason ?? "" } });
       this.#writer.close().catch(() => {});
@@ -406,6 +426,11 @@ export function makeUpgradeResponse(
  * the first to see the socket at serialization time. Either await open and accept that window
  * (fine for servers that speak second), or wrap the socket in a `WebSocketPair` as you dial and
  * answer with the other half (for servers that speak first; the pair buffers).
+ *
+ * On Workers, passing a socket that is not a native `WebSocket` instance falls back to the
+ * status-200 own-property spelling: such a Response still tunnels over RPC (the serializer
+ * duck-types the property), but cannot complete a real HTTP upgrade from a fetch handler --
+ * the runtime demands a native socket for that.
  */
 export function upgradeWebSocketResponse(webSocket: WebSocketLike, init?: ResponseInit): Response {
   // Validate here, at construction, so that a mistake surfaces at the call site rather than
@@ -425,9 +450,13 @@ export function upgradeWebSocketResponse(webSocket: WebSocketLike, init?: Respon
         `init.status (or pass 101).`);
   }
 
-  if (nativeWebSocketPair !== undefined) {
-    // Workers can (and must, if this Response is to complete a real upgrade) build the native
-    // form directly.
+  // On Workers, build the native form directly -- required if this Response is to complete a
+  // real HTTP upgrade. The Response constructor type-checks the socket, so a non-native
+  // WebSocketLike (say, a hand-rolled adapter) falls through to the expando spelling below,
+  // which the serializer duck-types just the same; such a Response tunnels fine over RPC but
+  // cannot complete a real upgrade from a fetch handler.
+  if (nativeWebSocketPair !== undefined &&
+      webSocket instanceof (globalThis as any).WebSocket) {
     return new Response(null, { ...init, status: 101, webSocket } as ResponseInit);
   } else {
     let { status, statusText, ...rest } = init ?? {};
@@ -467,24 +496,33 @@ function pumpNativeSocket(native: WebSocket, tunneled: TunneledWebSocket): void 
 type PairEvent = { type: "message", data: string | ArrayBuffer }
                | { type: "close", code: number, reason: string };
 
-// Copy an outgoing message into the form we deliver. Binary payloads are copied (and normalized
-// to ArrayBuffer, which is what workerd sockets deliver): delivery is asynchronous, so without a
-// copy, a sender reusing a scratch buffer would corrupt frames it already "sent".
+// Copy an outgoing message into the form we deliver (normalized to ArrayBuffer, which is what
+// workerd sockets deliver). The copy is DELIBERATELY SAFER than native: workerd does NOT copy
+// -- an in-flight frame aliases the sender's buffer, so reusing a scratch buffer after send()
+// corrupts undelivered frames on Workers. Our delivery is asynchronous, so without a copy that
+// hazard would be a certainty here; cross-platform authors should still not rely on it (see the
+// WebSocketPair docstring).
 function copyMessage(data: string | ArrayBuffer | ArrayBufferView): string | ArrayBuffer {
   if (typeof data === "string") {
     return data;
   } else if (data instanceof ArrayBuffer) {
     return data.slice(0);
   } else if (ArrayBuffer.isView(data)) {
-    return (data.buffer as ArrayBuffer).slice(data.byteOffset, data.byteOffset + data.byteLength);
+    // Copy via a fresh Uint8Array rather than buffer.slice(): a view over a SharedArrayBuffer
+    // must still yield a plain ArrayBuffer (slice() would yield another SharedArrayBuffer,
+    // violating the binary-as-ArrayBuffer contract and choking the tunnel's serializer).
+    let copy = new Uint8Array(data.byteLength);
+    copy.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    return copy.buffer;
   } else {
     throw new TypeError("Unsupported WebSocket message type.");
   }
 }
 
-// One half of a pure-JavaScript WebSocketPair, with workerd-faithful semantics. Its event
-// plumbing deliberately rhymes with TunneledWebSocket's above (same listener bookkeeping, same
-// event shapes) -- but it is a self-contained in-memory pipe, with none of the tunnel's
+// One half of a pure-JavaScript WebSocketPair, matching the semantics probed out of native
+// workerd pairs (each point pinned by __tests__/websocket-pair.test.ts). Its event plumbing
+// deliberately rhymes with TunneledWebSocket's above (same listener bookkeeping, same event
+// shapes) -- but it is a self-contained in-memory pipe, with none of the tunnel's
 // claim-on-interaction lifetime rules, so the two are kept as separate classes.
 //
 // The one rule that makes this a faithful stand-in for the native pair: ALL inbound delivery is
@@ -494,6 +532,16 @@ function copyMessage(data: string | ArrayBuffer | ArrayBufferView): string | Arr
 // its listeners synchronously afterwards (synchronous replay inside accept() would drop every
 // buffered frame), while other consumers attach listeners first and call accept() last. It also
 // means no listener ever runs synchronously inside the peer's send().
+//
+// Closure follows RFC 6455's half-close, exactly as the native pair does: close() puts this
+// half in CLOSING and queues a close event to the peer, but this half KEEPS RECEIVING -- the
+// peer may still flush final frames (and they are delivered) until it closes back. Both halves
+// reach CLOSED only once both have closed. A half never hears an event for its own close();
+// the close event completing the handshake carries the responding close's real code/reason.
+// (Native workerd matches this on every plain close handshake, but when data frames interleave
+// with the handshake in certain orders its internal pump instead reports the completion as a
+// 1006 "WebSocket disconnected without sending Close frame." -- an emergent artifact, probed as
+// data-dependent, which this pair deliberately determinizes to the clean outcome.)
 class JsWebSocketHalf {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
@@ -505,6 +553,12 @@ class JsWebSocketHalf {
   // Halves are born OPEN, like the native pair's; no "open" event ever fires.
   #readyState: number = JsWebSocketHalf.OPEN;
   #accepted = false;
+  // Whether this half has called close(). (Gates send/close, NOT receiving: native half-close
+  // keeps delivering the peer's frames to a closing half.)
+  #sentClose = false;
+  // Whether the peer's close event has been dispatched to this half. A close() that follows
+  // it completes the handshake (straight to CLOSED); otherwise close() only reaches CLOSING.
+  #receivedClose = false;
   // Inbound events awaiting delivery. Unbounded, matching workerd's pre-accept buffering.
   #inbox: PairEvent[] = [];
   #drainScheduled = false;
@@ -543,49 +597,59 @@ class JsWebSocketHalf {
 
   send(data: string | ArrayBuffer | ArrayBufferView): void {
     if (!this.#accepted) {
-      // workerd's exact message.
-      throw new TypeError("You must call accept() on this WebSocket before sending messages.");
+      // workerd's current message (older releases mentioned only accept()).
+      throw new TypeError(
+          "You must call one of accept() or state.acceptWebSocket() on this WebSocket before " +
+          "sending messages.");
     }
-    if (this.#readyState !== JsWebSocketHalf.OPEN) {
-      throw new Error("Can't call send() on a WebSocket that is closing or closed.");
+    if (this.#sentClose) {
+      // workerd's message. Note the gate is having CALLED close(), not readyState: a half that
+      // is CLOSING because its *peer* closed may absolutely still send (half-close), and the
+      // peer receives it.
+      throw new TypeError("Can't call WebSocket send() after close().");
     }
     this.#peer.#deliver({ type: "message", data: copyMessage(data) });
   }
 
   close(code?: number, reason?: string): void {
-    // workerd-faithful validation: close() can send code 1000 or 3000-4999 (or none, read as
-    // 1005 "no status received"), and a close reason is capped by RFC 6455's 125-byte control
-    // frame payload minus the 2-byte status code.
-    if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) {
+    if (!this.#accepted) {
+      // On workerd, close() routes through the same gate (and message) as send().
       throw new TypeError(
-          `Invalid WebSocket close code: ${code}. Close codes must be 1000 or in the range ` +
-          `3000-4999.`);
+          "You must call one of accept() or state.acceptWebSocket() on this WebSocket before " +
+          "sending messages.");
     }
-    if (reason !== undefined && new TextEncoder().encode(reason).length > 123) {
-      throw new TypeError("WebSocket close reason may be at most 123 bytes when UTF-8 encoded.");
+    // The no-op check precedes validation, as on workerd: a second close() is silently ignored
+    // even with invalid arguments.
+    if (this.#sentClose) return;
+
+    // workerd's validation: any code in 1000-4999 except the reserved 1004/1005/1006/1015, and
+    // a reason requires a code. (There is no reason-length cap on a native pair -- the RFC 6455
+    // 123-byte limit is a wire concern; closeSocket() still applies its own policy when
+    // propagating onto real sockets.)
+    if (code !== undefined &&
+        !(code >= 1000 && code <= 4999 &&
+          code !== 1004 && code !== 1005 && code !== 1006 && code !== 1015)) {
+      throw new TypeError(`Invalid WebSocket close code: ${code}.`);
     }
-    if (this.#readyState >= JsWebSocketHalf.CLOSING) return;
-    this.#readyState = JsWebSocketHalf.CLOSING;
+    if (reason !== undefined && code === undefined) {
+      throw new TypeError(
+          "If you specify a WebSocket close reason, you must also specify a code.");
+    }
 
-    // The closing half stops receiving: whatever was queued for it will never be delivered.
-    // (Closing before accept() is legal -- that's how an unsent upgrade Response's socket is
-    // released -- the peer, once accepted, still hears the close.)
-    this.#inbox.length = 0;
-
-    let close = { type: "close" as const, code: code ?? 1005, reason: reason ?? "" };
-    this.#peer.#deliver(close);
-
-    // For an in-memory pipe the close handshake completes immediately, so -- like a real socket
-    // whose peer's stack acknowledged the Close frame -- the closing half hears its own close
-    // event too (asynchronously, after which both halves are CLOSED). webSocketToStreams()
-    // depends on this echo: a close written down the tunnel close()s the wrapped half, and the
-    // resulting close event on that same half is what carries the closure back to the tunnel's
-    // other end. (Bypasses #deliver(), which drops events once closing has begun.)
-    this.#inbox.push({ ...close });
-    this.#scheduleDrain();
+    this.#sentClose = true;
+    // Closing BACK (completing a handshake the peer initiated) finishes this half immediately;
+    // an initiating (or crossing) close leaves it CLOSING until the peer closes back, still
+    // receiving in the meantime -- no inbox clearing (half-close). Either way the peer hears
+    // our real code/reason.
+    this.#readyState =
+        this.#receivedClose ? JsWebSocketHalf.CLOSED : JsWebSocketHalf.CLOSING;
+    this.#peer.#deliver({ type: "close", code: code ?? 1005, reason: reason ?? "" });
   }
 
   [Symbol.dispose](): void {
+    // Disposal must release the half even if it was never accepted (close() before accept()
+    // throws, like workerd's); accepting a half we're throwing away is harmless.
+    this.accept();
     this.close();
   }
 
@@ -608,20 +672,36 @@ class JsWebSocketHalf {
 
   // (Note that "error" listeners are accepted but never dispatched: an in-memory pipe has no
   // transport failures.)
+  //
+  // A throwing listener is reported and delivery CONTINUES -- a deliberate divergence from
+  // native workerd, which wedges the half's delivery permanently after a listener throws.
+  // Wedged-but-only-until-the-next-send is the worst of both worlds (stale frames suddenly
+  // replaying much later), and letting the throw escape the microtask pump would crash the
+  // process on Node; robust delivery is the useful behavior.
   #dispatchEvent(type: string, event: any): void {
     for (let entry of [...this.#listeners.get(type) ?? []]) {
       if (entry.once) this.removeEventListener(type, entry.listener);
-      entry.listener(event);
+      try {
+        entry.listener(event);
+      } catch (err) {
+        console.error(err);
+      }
     }
     let handler = (this as any)["on" + type];
-    if (typeof handler === "function") handler.call(this, event);
+    if (typeof handler === "function") {
+      try {
+        handler.call(this, event);
+      } catch (err) {
+        console.error(err);
+      }
+    }
   }
 
-  // Called by the peer to queue an event for this half. Once this half has begun closing, it no
-  // longer receives anything: messages racing with closure are dropped, as they would be on a
-  // direct connection.
+  // Called by the peer to queue an event for this half. No state guard: a half that has called
+  // close() keeps receiving until the peer's close event reaches it (half-close), and FIFO
+  // guarantees a close event is the last thing in the inbox -- the peer can send nothing after
+  // its own close().
   #deliver(event: PairEvent): void {
-    if (this.#readyState >= JsWebSocketHalf.CLOSING) return;
     this.#inbox.push(event);
     this.#scheduleDrain();
   }
@@ -643,9 +723,15 @@ class JsWebSocketHalf {
     while (this.#accepted && this.#inbox.length > 0) {
       let event = this.#inbox.shift()!;
       if (event.type === "close") {
-        this.#readyState = JsWebSocketHalf.CLOSED;
-        this.#inbox.length = 0;
-        this.#dispatchEvent("close", { type: "close", code: event.code, reason: event.reason });
+        this.#receivedClose = true;
+        // The state updates BEFORE the event dispatches, matching native: the listener
+        // observes CLOSING when this half hasn't closed itself yet (it may still send), and
+        // CLOSED when this event completes a handshake this half already closed its side of.
+        this.#readyState =
+            this.#sentClose ? JsWebSocketHalf.CLOSED : JsWebSocketHalf.CLOSING;
+        this.#dispatchEvent("close",
+            { type: "close", code: event.code, reason: event.reason, wasClean: true });
+        // A close event is always last in the inbox (see #deliver), so we're done.
         return;
       } else {
         this.#dispatchEvent("message", { type: "message", data: event.data });
@@ -685,7 +771,25 @@ type WebSocketPairHalf = {
  * Cloudflare Workers this IS the native `WebSocketPair` (aliased at module load, so there is
  * exactly one behavior per platform); elsewhere it is a pure-JavaScript pair with workerd
  * semantics -- halves born OPEN (no "open" event ever fires), each buffering inbound messages
- * without bound until its accept() is called, delivery always asynchronous.
+ * without bound until its accept() is called, delivery always asynchronous, and RFC 6455
+ * half-close: a half that close()s can no longer send but KEEPS RECEIVING until its peer
+ * closes back, and both halves reach CLOSED only once both have closed. A half never hears a
+ * close event for its own close().
+ *
+ * The pure-JS pair diverges from native workerd in exactly four deliberate ways:
+ *
+ * - Binary frames are COPIED at send() time. Native workerd does not copy -- an in-flight
+ *   frame aliases the sender's buffer, so mutating a scratch buffer after send() corrupts
+ *   frames on Workers. Don't rely on the copy in cross-platform code.
+ * - Events are plain objects (`{type, data}` / `{type, code, reason, wasClean}`), matching the
+ *   tunneled sockets this library produces -- not MessageEvent/CloseEvent instances as on
+ *   workerd.
+ * - A throwing listener is reported via console.error and delivery continues; native workerd
+ *   permanently stops delivering to a half whose listener threw.
+ * - A close handshake always completes cleanly: the closing half hears the responding close's
+ *   real code/reason (wasClean true). Native does the same on plain handshakes, but reports a
+ *   1006 disconnect instead when data frames interleave with the handshake in certain orders
+ *   -- an internal-pump artifact this pair does not reproduce.
  *
  * Use it when the provider answering an upgrade IS the endpoint, with no underlying socket to
  * pass through:

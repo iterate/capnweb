@@ -1568,8 +1568,12 @@ export class RpcPayload {
             hook.dispose();
           } else {
             // The response was never serialized, so no one can ever receive this socket. Close
-            // it so the connection isn't left dangling.
-            try { webSocket.close(); } catch {}
+            // it so the connection isn't left dangling. Accept first: a Workers-style socket
+            // (including a WebSocketPair half, the idiomatic thing to find here) refuses
+            // close() before accept(), and accepting a socket we're about to throw away is
+            // harmless everywhere -- ws/browser sockets have no accept(), and for a tunneled
+            // socket accept() merely claims it.
+            try { (webSocket as any).accept?.(); webSocket.close(); } catch {}
           }
         }
         return;
