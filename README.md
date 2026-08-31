@@ -426,6 +426,37 @@ Some details to be aware of:
   WebSockets buffer incoming messages until then, but on platforms whose sockets don't buffer
   (e.g. Node with `ws`), messages that arrive before that point are dropped.
 
+#### Answering upgrades
+
+The comment in the example above deserves a real API: `upgradeWebSocketResponse(socket, init?)`
+is the blessed way to answer a fetch with a WebSocket upgrade, on any runtime. On Cloudflare
+Workers it produces the native `new Response(null, { status: 101, webSocket })`; elsewhere it
+produces a wire-equivalent status-200 `Response` carrying the socket (an upgrade's status is
+never serialized, so `init.status` other than 101 is rejected -- headers such as a negotiated
+`Sec-WebSocket-Protocol` ride along). A socket can only be sent over RPC once.
+
+For a *passthrough* socket (the provider dials some upstream server on the caller's behalf)
+there are two postures:
+
+* **Await open, then answer** (the default): a dial failure surfaces as an ordinary error
+  answer. Note the drop window above -- fine for servers that only speak when spoken to.
+* **Wrap in a `WebSocketPair` as you dial** for servers that speak first: wire the upstream
+  socket to one half immediately, answer with the other; the pair buffers frames that arrive
+  before the `Response` is serialized.
+
+When the provider *is* the endpoint -- there is no underlying socket -- use the exported
+`WebSocketPair`, which is the native class on Workers and a workerd-faithful pure-JS pair
+everywhere else, making the Workers idiom universal:
+
+```ts
+import { upgradeWebSocketResponse, WebSocketPair } from "capnweb";
+
+let pair = new WebSocketPair();
+pair[1].accept();
+pair[1].addEventListener("message", event => pair[1].send(`echo: ${event.data}`));
+return upgradeWebSocketResponse(pair[0]);
+```
+
 The wire representation is described in [the protocol documentation](protocol.md).
 
 ### Cloudflare Workers RPC interoperability

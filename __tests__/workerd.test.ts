@@ -5,9 +5,12 @@
 /// <reference types="@cloudflare/workers-types" />
 import { expect, it, describe } from "vitest";
 import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget, env, DurableObject } from "cloudflare:workers";
-import { newHttpBatchRpcSession, newWebSocketRpcSession, RpcStub, RpcPromise, RpcTarget } from "../src/index-workers.js";
+// Cap'n Web's WebSocketPair export is imported under an alias so that the bare `WebSocketPair`
+// references in the tests below keep pinning the raw native global spelling.
+import { newHttpBatchRpcSession, newWebSocketRpcSession, RpcStub, RpcPromise, RpcTarget,
+         WebSocketPair as CapnwebWebSocketPair } from "../src/index-workers.js";
 import { v, wrapServerTarget, type ServiceValidator } from "../packages/capnweb-validate/src/internal/core.js";
-import { Counter, TestTarget } from "./test-util.js";
+import { Counter, DeviceEchoTarget, TestTarget } from "./test-util.js";
 
 class JsCounter extends RpcTarget {
   constructor(private i: number = 0) {
@@ -332,6 +335,38 @@ describe("workerd RPC server", () => {
 
     expect(await message).toBe("hello over Response.webSocket");
     socket!.close();
+  });
+
+  it("exports the native WebSocketPair on workerd", () => {
+    // On workerd, Cap'n Web's WebSocketPair is the native class itself (aliased at module
+    // load), so there is exactly one pair behavior per platform.
+    expect(CapnwebWebSocketPair).toBe((globalThis as any).WebSocketPair);
+  });
+
+  it("answers an upgrade via upgradeWebSocketResponse() with a genuine 101 and native socket",
+      async () => {
+    // The provider is the shared DeviceEchoTarget from test-util.ts -- the exact same source
+    // runs under Node in websocket-tunnel.test.ts, over the pure-JS pair. Here, on workerd,
+    // upgradeWebSocketResponse() must produce the real thing: status 101 and a native
+    // WebSocket, suitable for completing an actual HTTP upgrade.
+    let pair = new WebSocketPair();
+    pair[0].accept();
+    pair[1].accept();
+    let api: any = newWebSocketRpcSession(pair[0]);
+    newWebSocketRpcSession(pair[1], new DeviceEchoTarget());
+
+    let response: Response = await api.openDeviceEcho();
+    expect(response.status).toBe(101);
+    let socket = response.webSocket;
+    expect(socket).toBeInstanceOf(WebSocket);
+
+    socket!.accept();
+    let message = new Promise(resolve => {
+      socket!.addEventListener("message", event => resolve(event.data), { once: true });
+    });
+    socket!.send("hello");
+    expect(await message).toBe("device-echo:hello");
+    socket!.close(1000, "done");
   });
 
   it("can accept WebSocket RPC connections", async () => {

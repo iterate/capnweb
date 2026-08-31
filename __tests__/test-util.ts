@@ -4,7 +4,7 @@
 
 // Common RPC interfaces / implementations used in several tests.
 
-import { RpcStub, RpcTarget } from '../src/index.js';
+import { RpcStub, RpcTarget, upgradeWebSocketResponse, WebSocketPair } from '../src/index.js';
 
 export class Counter extends RpcTarget {
   constructor(private i: number = 0) {
@@ -85,5 +85,19 @@ export class TestTarget extends RpcTarget {
   async echoBlob(blob: Blob): Promise<Blob> {
     let bytes = await blob.arrayBuffer();
     return new Blob([bytes], {type: blob.type});
+  }
+}
+
+// A provider that IS the WebSocket endpoint: it answers an upgrade with one half of a
+// WebSocketPair and speaks through the other. This exact class runs under both Node
+// (websocket-tunnel.test.ts, over the pure-JS pair) and workerd (workerd.test.ts, over the
+// native pair) -- a tripwire against semantic drift between the two WebSocketPair
+// implementations.
+export class DeviceEchoTarget extends RpcTarget {
+  openDeviceEcho(): Response {
+    let pair = new WebSocketPair();
+    pair[1].accept();
+    pair[1].addEventListener("message", event => pair[1].send(`device-echo:${event.data}`));
+    return upgradeWebSocketResponse(pair[0]);
   }
 }

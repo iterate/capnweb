@@ -24,13 +24,29 @@
 // nested Cap'n Web session. __tests__/websocket-tunnel.test.ts proves transport equivalence by
 // running the shared session test battery (__tests__/session-battery.ts) over a tunneled socket,
 // mirroring how index.test.ts runs the same battery over a direct WebSocket connection.
+//
+// This file also covers the sender's edge: upgradeWebSocketResponse() spells "answer this fetch
+// with this WebSocket" identically on every runtime (only Cloudflare Workers can construct the
+// native 101 Response), and the exported WebSocketPair gives non-Workers providers the same
+// two-crosswired-halves primitive Workers has, for when the provider *is* the endpoint.
 
 import { StubHook, RpcPayload, streamImpl } from "./core.js";
 
-// The subset of the WebSocket API that we rely on. Covers browser WebSockets, the `ws` package,
-// Cloudflare Workers WebSockets (which add accept()), and TunneledWebSocket itself (which is
-// what we wrap when proxying an already-tunneled socket onward to a third party).
-interface WebSocketLike {
+// The runtime's native WebSocketPair (a Cloudflare Workers API), captured at module load time.
+// We must probe the *global* here rather than referencing the bare name below: this module
+// exports a `WebSocketPair` of its own, and the module-scope binding would shadow the global --
+// making a bare `typeof WebSocketPair` check truthy on every platform and sending
+// makeUpgradeResponse() down the workerd-only branch on Node and in browsers.
+const nativeWebSocketPair: (new () => { 0: WebSocket, 1: WebSocket }) | undefined =
+    (globalThis as any).WebSocketPair;
+
+/**
+ * The subset of the WebSocket API that the tunnel relies on. Covers browser WebSockets, `ws` /
+ * undici client sockets, Cloudflare Workers WebSockets (which add accept()), one half of a
+ * `WebSocketPair`, and a tunneled socket received from another session (which is what we wrap
+ * when proxying an already-tunneled socket onward to a third party).
+ */
+export interface WebSocketLike {
   send(data: string | Uint8Array): void;
   close(code?: number, reason?: string): void;
   accept?(): void;
@@ -360,13 +376,63 @@ export function makeUpgradeResponse(
     readable: ReadableStream, writableHook: StubHook, init: ResponseInit): Response {
   let socket = new TunneledWebSocket(readable, writableHook);
 
-  if (typeof WebSocketPair !== "undefined") {
-    let pair = new WebSocketPair();
+  if (nativeWebSocketPair !== undefined) {
+    let pair = new nativeWebSocketPair();
     pumpNativeSocket(pair[1], socket);
     return new Response(null, { ...init, status: 101, webSocket: pair[0] } as ResponseInit);
   } else {
     let response = new Response(null, init);
     Object.defineProperty(response, "webSocket", { value: socket, configurable: true });
+    return response;
+  }
+}
+
+/**
+ * Constructs a `Response` that answers a `fetch()` with a WebSocket upgrade, carrying
+ * `webSocket` -- the universal spelling of what Cloudflare Workers code writes as
+ * `new Response(null, { status: 101, webSocket })`.
+ *
+ * On Workers this produces exactly that native Response, so it can also be returned straight
+ * from a real fetch handler. On every other runtime -- where the standard Response constructor
+ * refuses to produce 1xx statuses -- it produces a status-200 `Response` (any `init.status` /
+ * `init.statusText` is stripped) carrying `webSocket` as the non-standard own-property. The two
+ * are identical on the wire: an upgrade implies status 101, so the status is never serialized.
+ * `init.headers` (e.g. a negotiated Sec-WebSocket-Protocol) rides along.
+ *
+ * The socket's frames begin tunneling toward the receiver the moment the Response is
+ * serialized, and a socket can be sent over RPC only once. Note the passthrough caveat: for
+ * sockets without accept() (e.g. `ws` or browser sockets being proxied through), frames that
+ * arrive between the dial's open and the Response's serialization are dropped -- Cap'n Web is
+ * the first to see the socket at serialization time. Either await open and accept that window
+ * (fine for servers that speak second), or wrap the socket in a `WebSocketPair` as you dial and
+ * answer with the other half (for servers that speak first; the pair buffers).
+ */
+export function upgradeWebSocketResponse(webSocket: WebSocketLike, init?: ResponseInit): Response {
+  // Validate here, at construction, so that a mistake surfaces at the call site rather than
+  // deep inside the serializer (or worse, only on the platform you didn't test on).
+  let missing = (["send", "close", "addEventListener"] as const)
+      .filter(method => typeof (webSocket as any)?.[method] !== "function");
+  if (missing.length > 0) {
+    throw new TypeError(
+        `upgradeWebSocketResponse() expected a WebSocket-like object with callable send(), ` +
+        `close(), and addEventListener(), but ${missing.join(", ")} ` +
+        `${missing.length === 1 ? "is" : "are"} missing. (Did you pass the whole ` +
+        `WebSocketPair instead of one half?)`);
+  }
+  if (init?.status !== undefined && init.status !== 101) {
+    throw new TypeError(
+        `A WebSocket upgrade Response implies status 101; got status ${init.status}. Omit ` +
+        `init.status (or pass 101).`);
+  }
+
+  if (nativeWebSocketPair !== undefined) {
+    // Workers can (and must, if this Response is to complete a real upgrade) build the native
+    // form directly.
+    return new Response(null, { ...init, status: 101, webSocket } as ResponseInit);
+  } else {
+    let { status, statusText, ...rest } = init ?? {};
+    let response = new Response(null, rest);
+    Object.defineProperty(response, "webSocket", { value: webSocket, configurable: true });
     return response;
   }
 }
@@ -396,3 +462,242 @@ function pumpNativeSocket(native: WebSocket, tunneled: TunneledWebSocket): void 
   tunneled.addEventListener("close", event => closeSocket(native, event.code, event.reason));
   tunneled.addEventListener("error", () => closeSocket(native));
 }
+
+// An event queued for delivery to one half of a JsWebSocketPair.
+type PairEvent = { type: "message", data: string | ArrayBuffer }
+               | { type: "close", code: number, reason: string };
+
+// Copy an outgoing message into the form we deliver. Binary payloads are copied (and normalized
+// to ArrayBuffer, which is what workerd sockets deliver): delivery is asynchronous, so without a
+// copy, a sender reusing a scratch buffer would corrupt frames it already "sent".
+function copyMessage(data: string | ArrayBuffer | ArrayBufferView): string | ArrayBuffer {
+  if (typeof data === "string") {
+    return data;
+  } else if (data instanceof ArrayBuffer) {
+    return data.slice(0);
+  } else if (ArrayBuffer.isView(data)) {
+    return (data.buffer as ArrayBuffer).slice(data.byteOffset, data.byteOffset + data.byteLength);
+  } else {
+    throw new TypeError("Unsupported WebSocket message type.");
+  }
+}
+
+// One half of a pure-JavaScript WebSocketPair, with workerd-faithful semantics. Its event
+// plumbing deliberately rhymes with TunneledWebSocket's above (same listener bookkeeping, same
+// event shapes) -- but it is a self-contained in-memory pipe, with none of the tunnel's
+// claim-on-interaction lifetime rules, so the two are kept as separate classes.
+//
+// The one rule that makes this a faithful stand-in for the native pair: ALL inbound delivery is
+// asynchronous -- each half buffers (without bound, like workerd) until its accept() is called,
+// and then drains via a microtask pump, strict FIFO, messages before close. That makes both
+// real-world consumption orders correct: webSocketToStreams() calls accept() first and attaches
+// its listeners synchronously afterwards (synchronous replay inside accept() would drop every
+// buffered frame), while other consumers attach listeners first and call accept() last. It also
+// means no listener ever runs synchronously inside the peer's send().
+class JsWebSocketHalf {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+
+  // Set once by makePair(); a half never exists without its peer.
+  #peer!: JsWebSocketHalf;
+  // Halves are born OPEN, like the native pair's; no "open" event ever fires.
+  #readyState: number = JsWebSocketHalf.OPEN;
+  #accepted = false;
+  // Inbound events awaiting delivery. Unbounded, matching workerd's pre-accept buffering.
+  #inbox: PairEvent[] = [];
+  #drainScheduled = false;
+  #listeners = new Map<string, { listener: Listener, once: boolean }[]>();
+  #onmessage: Listener | null = null;
+  #onclose: Listener | null = null;
+  #onerror: Listener | null = null;
+
+  // The serializer (and WebSocketTransport) sets this. Binary messages are always delivered as
+  // ArrayBuffer -- workerd behavior -- so there is nothing for it to change.
+  binaryType: string = "arraybuffer";
+
+  static makePair(): [JsWebSocketHalf, JsWebSocketHalf] {
+    let a = new JsWebSocketHalf();
+    let b = new JsWebSocketHalf();
+    a.#peer = b;
+    b.#peer = a;
+    return [a, b];
+  }
+
+  get readyState(): number { return this.#readyState; }
+
+  get onmessage() { return this.#onmessage; }
+  set onmessage(listener: Listener | null) { this.#onmessage = listener; }
+  get onclose() { return this.#onclose; }
+  set onclose(listener: Listener | null) { this.#onclose = listener; }
+  get onerror() { return this.#onerror; }
+  set onerror(listener: Listener | null) { this.#onerror = listener; }
+
+  // Starts delivery. Idempotent, like workerd's.
+  accept(): void {
+    if (this.#accepted) return;
+    this.#accepted = true;
+    this.#scheduleDrain();
+  }
+
+  send(data: string | ArrayBuffer | ArrayBufferView): void {
+    if (!this.#accepted) {
+      // workerd's exact message.
+      throw new TypeError("You must call accept() on this WebSocket before sending messages.");
+    }
+    if (this.#readyState !== JsWebSocketHalf.OPEN) {
+      throw new Error("Can't call send() on a WebSocket that is closing or closed.");
+    }
+    this.#peer.#deliver({ type: "message", data: copyMessage(data) });
+  }
+
+  close(code?: number, reason?: string): void {
+    // workerd-faithful validation: close() can send code 1000 or 3000-4999 (or none, read as
+    // 1005 "no status received"), and a close reason is capped by RFC 6455's 125-byte control
+    // frame payload minus the 2-byte status code.
+    if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) {
+      throw new TypeError(
+          `Invalid WebSocket close code: ${code}. Close codes must be 1000 or in the range ` +
+          `3000-4999.`);
+    }
+    if (reason !== undefined && new TextEncoder().encode(reason).length > 123) {
+      throw new TypeError("WebSocket close reason may be at most 123 bytes when UTF-8 encoded.");
+    }
+    if (this.#readyState >= JsWebSocketHalf.CLOSING) return;
+    this.#readyState = JsWebSocketHalf.CLOSING;
+
+    // The closing half stops receiving: whatever was queued for it will never be delivered.
+    // (Closing before accept() is legal -- that's how an unsent upgrade Response's socket is
+    // released -- the peer, once accepted, still hears the close.)
+    this.#inbox.length = 0;
+
+    let close = { type: "close" as const, code: code ?? 1005, reason: reason ?? "" };
+    this.#peer.#deliver(close);
+
+    // For an in-memory pipe the close handshake completes immediately, so -- like a real socket
+    // whose peer's stack acknowledged the Close frame -- the closing half hears its own close
+    // event too (asynchronously, after which both halves are CLOSED). webSocketToStreams()
+    // depends on this echo: a close written down the tunnel close()s the wrapped half, and the
+    // resulting close event on that same half is what carries the closure back to the tunnel's
+    // other end. (Bypasses #deliver(), which drops events once closing has begun.)
+    this.#inbox.push({ ...close });
+    this.#scheduleDrain();
+  }
+
+  [Symbol.dispose](): void {
+    this.close();
+  }
+
+  addEventListener(type: string, listener: Listener, options?: { once?: boolean }): void {
+    let list = this.#listeners.get(type);
+    if (!list) {
+      list = [];
+      this.#listeners.set(type, list);
+    }
+    list.push({ listener, once: !!options?.once });
+  }
+
+  removeEventListener(type: string, listener: Listener): void {
+    let list = this.#listeners.get(type);
+    let index = list?.findIndex(entry => entry.listener === listener) ?? -1;
+    if (index >= 0) {
+      list!.splice(index, 1);
+    }
+  }
+
+  // (Note that "error" listeners are accepted but never dispatched: an in-memory pipe has no
+  // transport failures.)
+  #dispatchEvent(type: string, event: any): void {
+    for (let entry of [...this.#listeners.get(type) ?? []]) {
+      if (entry.once) this.removeEventListener(type, entry.listener);
+      entry.listener(event);
+    }
+    let handler = (this as any)["on" + type];
+    if (typeof handler === "function") handler.call(this, event);
+  }
+
+  // Called by the peer to queue an event for this half. Once this half has begun closing, it no
+  // longer receives anything: messages racing with closure are dropped, as they would be on a
+  // direct connection.
+  #deliver(event: PairEvent): void {
+    if (this.#readyState >= JsWebSocketHalf.CLOSING) return;
+    this.#inbox.push(event);
+    this.#scheduleDrain();
+  }
+
+  // The microtask pump: one per half. Scheduling is a no-op until accept().
+  #scheduleDrain(): void {
+    if (this.#drainScheduled || !this.#accepted || this.#inbox.length === 0) return;
+    this.#drainScheduled = true;
+    queueMicrotask(() => {
+      this.#drainScheduled = false;
+      this.#drain();
+    });
+  }
+
+  #drain(): void {
+    // Events appended while draining (e.g. by a listener poking the peer, which synchronously
+    // delivers back to us) are picked up by the same loop -- still asynchronous with respect to
+    // the send() that queued them.
+    while (this.#accepted && this.#inbox.length > 0) {
+      let event = this.#inbox.shift()!;
+      if (event.type === "close") {
+        this.#readyState = JsWebSocketHalf.CLOSED;
+        this.#inbox.length = 0;
+        this.#dispatchEvent("close", { type: "close", code: event.code, reason: event.reason });
+        return;
+      } else {
+        this.#dispatchEvent("message", { type: "message", data: event.data });
+      }
+    }
+  }
+}
+
+// A pure-JavaScript WebSocketPair with the native class's shape: construct it, get two
+// crosswired halves at indexes 0 and 1.
+class JsWebSocketPair {
+  0: JsWebSocketHalf;
+  1: JsWebSocketHalf;
+
+  constructor() {
+    let [a, b] = JsWebSocketHalf.makePair();
+    this[0] = a;
+    this[1] = b;
+  }
+}
+
+// The surface a pair half guarantees on every platform -- the intersection of the native
+// workerd WebSocket and JsWebSocketHalf that the endpoint idiom needs. (On workerd the halves
+// are genuinely native WebSockets, which carry more.)
+type WebSocketPairHalf = {
+  accept(): void;
+  send(data: string | ArrayBuffer | ArrayBufferView): void;
+  close(code?: number, reason?: string): void;
+  readonly readyState: number;
+  addEventListener(type: string, listener: (event: any) => void,
+                   options?: { once?: boolean }): void;
+  removeEventListener(type: string, listener: (event: any) => void): void;
+};
+
+/**
+ * Two crosswired WebSocket halves: whatever is sent on one is received by the other. On
+ * Cloudflare Workers this IS the native `WebSocketPair` (aliased at module load, so there is
+ * exactly one behavior per platform); elsewhere it is a pure-JavaScript pair with workerd
+ * semantics -- halves born OPEN (no "open" event ever fires), each buffering inbound messages
+ * without bound until its accept() is called, delivery always asynchronous.
+ *
+ * Use it when the provider answering an upgrade IS the endpoint, with no underlying socket to
+ * pass through:
+ *
+ *     let pair = new WebSocketPair();
+ *     pair[1].accept();
+ *     pair[1].addEventListener("message", event => pair[1].send(`echo: ${event.data}`));
+ *     return upgradeWebSocketResponse(pair[0]);
+ *
+ * ...or to wrap an upstream socket whose server speaks first: wire the socket to one half as
+ * you dial, and answer with the other half -- the pair buffers frames that would otherwise be
+ * dropped before the Response is serialized.
+ */
+export const WebSocketPair: new () => { 0: WebSocketPairHalf, 1: WebSocketPairHalf } =
+    (nativeWebSocketPair ?? JsWebSocketPair) as any;

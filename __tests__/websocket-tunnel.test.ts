@@ -5,8 +5,9 @@
 import { expect, it, describe, beforeAll, afterAll } from "vitest";
 import type { AddressInfo } from "node:net";
 import { WebSocket as NodeWebSocket, WebSocketServer } from "ws";
-import { newWebSocketRpcSession, RpcTarget } from "../src/index.js";
-import { TestTarget } from "./test-util.js";
+import { newWebSocketRpcSession, RpcTarget, upgradeWebSocketResponse, WebSocketPair }
+    from "../src/index.js";
+import { DeviceEchoTarget, TestTarget } from "./test-util.js";
 import { registerSessionTestBattery } from "./session-battery.js";
 
 // Outside of Cloudflare Workers, the Response constructor can't produce an upgrade response, so
@@ -62,8 +63,18 @@ describe("WebSocket upgrade responses over RPC", () => {
   let slammingServer = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   slammingServer.on("connection", socket => socket.close(4321, "go away"));
 
+  // A server that speaks FIRST: it sends a greeting the moment a connection opens, then echoes.
+  // This is the race the wrap-in-WebSocketPair posture exists to win -- a socket without
+  // accept() drops frames that arrive between the dial's open and the Response's serialization.
+  let speakFirstServer = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  speakFirstServer.on("connection", socket => {
+    socket.send("hello-first");
+    socket.on("message", data => socket.send(`speak-first-echo:${data}`));
+  });
+
   class TestApi extends RpcTarget {
-    constructor(private echoPort: number, private slammingPort: number) { super(); }
+    constructor(private echoPort: number, private slammingPort: number,
+                private speakFirstPort: number) { super(); }
 
     // Returns a bare WebSocket, which is not serializable.
     async openBareSocket(): Promise<unknown> {
@@ -76,6 +87,64 @@ describe("WebSocket upgrade responses over RPC", () => {
 
     async openSlamming(): Promise<Response> {
       return responseWithWebSocket(await openWebSocket(this.slammingPort));
+    }
+
+    // Like openEcho()/openSlamming(), but answered through the blessed API instead of the raw
+    // expando spelling (which the tests above deliberately keep pinning for back-compat).
+    async openEchoBlessed(): Promise<Response> {
+      return upgradeWebSocketResponse(await openWebSocket(this.echoPort));
+    }
+
+    async openSlammingBlessed(): Promise<Response> {
+      return upgradeWebSocketResponse(await openWebSocket(this.slammingPort));
+    }
+
+    // The endpoint shape: the provider IS the WebSocket server. Same source as the workerd lane
+    // (see test-util.ts).
+    openDeviceEcho(): Response {
+      return new DeviceEchoTarget().openDeviceEcho();
+    }
+
+    // The speak-first passthrough posture: wrap the upstream socket in a WebSocketPair as we
+    // dial -- before awaiting open -- so frames the server fires off immediately land in the
+    // pair's buffer instead of the drop window before serialization.
+    async openSpeakFirst(): Promise<Response> {
+      let local = new NodeWebSocket(`ws://127.0.0.1:${this.speakFirstPort}`);
+      let pair = new WebSocketPair();
+      pair[1].accept();
+      local.addEventListener("message", (event: any) => pair[1].send(event.data));
+      local.addEventListener("close", (event: any) => {
+        try { pair[1].close(event.code, event.reason); } catch { pair[1].close(); }
+      });
+      pair[1].addEventListener("message", event => local.send(event.data));
+      pair[1].addEventListener("close", event => {
+        try { local.close(event.code, event.reason); } catch { local.close(); }
+      });
+      await new Promise<void>((resolve, reject) => {
+        local.addEventListener("open", () => resolve(), { once: true });
+        local.addEventListener("error", () => reject(new Error("local dial failed")),
+                               { once: true });
+      });
+      return upgradeWebSocketResponse(pair[0]);
+    }
+
+    // Returns a pair-backed upgrade Response that the caller is expected to ignore, keeping the
+    // other half so the test can observe its release.
+    pairCloseEvent?: Promise<any>;
+    openPairIgnored(): Response {
+      let pair = new WebSocketPair();
+      pair[1].accept();
+      this.pairCloseEvent = nextEvent(pair[1], "close");
+      return upgradeWebSocketResponse(pair[0]);
+    }
+
+    pairOpened(): boolean {
+      return this.pairCloseEvent !== undefined;
+    }
+
+    async waitForPairClose(): Promise<unknown> {
+      let event = await this.pairCloseEvent;
+      return { code: event.code, reason: event.reason };
     }
 
     // Takes an upgrade Response as a *parameter*, sends a message on its socket, and returns
@@ -123,10 +192,11 @@ describe("WebSocket upgrade responses over RPC", () => {
   let api: any;
 
   beforeAll(async () => {
-    let [echoPort, slammingPort, rpcPort] = await Promise.all([
-      listening(echoServer), listening(slammingServer), listening(rpcServer)]);
+    let [echoPort, slammingPort, speakFirstPort, rpcPort] = await Promise.all([
+      listening(echoServer), listening(slammingServer), listening(speakFirstServer),
+      listening(rpcServer)]);
     rpcServer.on("connection", socket => {
-      newWebSocketRpcSession(socket as any, new TestApi(echoPort, slammingPort));
+      newWebSocketRpcSession(socket as any, new TestApi(echoPort, slammingPort, speakFirstPort));
     });
     clientSocket = new NodeWebSocket(`ws://127.0.0.1:${rpcPort}`);
     api = newWebSocketRpcSession(clientSocket as any);
@@ -135,7 +205,8 @@ describe("WebSocket upgrade responses over RPC", () => {
   afterAll(async () => {
     clientSocket.close();
     await Promise.all([
-      closeServer(rpcServer), closeServer(echoServer), closeServer(slammingServer)]);
+      closeServer(rpcServer), closeServer(echoServer), closeServer(slammingServer),
+      closeServer(speakFirstServer)]);
   });
 
   it("refuses to serialize a bare WebSocket", async () => {
@@ -239,6 +310,85 @@ describe("WebSocket upgrade responses over RPC", () => {
       await closeServer(proxyServer);
     }
   });
+
+  it("tunnels a socket answered via upgradeWebSocketResponse()", async () => {
+    let response = await api.openEchoBlessed();
+    expect(response.webSocket).toBeTruthy();
+    let socket = response.webSocket;
+
+    let echoed = nextEvent(socket, "message");
+    socket.send("hello");
+    expect((await echoed).data).toBe("hello");
+
+    let binaryEchoed = nextEvent(socket, "message");
+    socket.send(new Uint8Array([4, 5, 6]));
+    expect(Array.from((await binaryEchoed).data)).toEqual([4, 5, 6]);
+
+    let closeEvent = nextEvent(socket, "close");
+    socket.close(1000, "done");
+    expect(await closeEvent).toMatchObject({ code: 1000, reason: "done" });
+    expect(socket.readyState).toBe(3);  // CLOSED
+  });
+
+  it("propagates a remote-peer close through a blessed answer", async () => {
+    let socket = (await api.openSlammingBlessed()).webSocket;
+    expect(await nextEvent(socket, "close")).toMatchObject({ code: 4321, reason: "go away" });
+  });
+
+  it("answers with one half of a WebSocketPair while the provider speaks through the other",
+      async () => {
+    let socket = (await api.openDeviceEcho()).webSocket;
+
+    let echoed = nextEvent(socket, "message");
+    socket.send("hi");
+    expect((await echoed).data).toBe("device-echo:hi");
+
+    let closeEvent = nextEvent(socket, "close");
+    socket.close(1000, "done");
+    expect(await closeEvent).toMatchObject({ code: 1000, reason: "done" });
+    expect(socket.readyState).toBe(3);  // CLOSED
+  });
+
+  it("refuses to send the same pair-half Response twice", async () => {
+    let pair = new WebSocketPair();
+    let response = upgradeWebSocketResponse(pair[0]);
+    try {
+      // Thrown synchronously, while serializing the call, just like the raw-socket case above.
+      expect(() => api.relay(response, response)).toThrow(/only be sent over RPC once/);
+    } finally {
+      pair[0].close();
+    }
+  });
+
+  it("closes the provider's kept half when a returned Response is never touched", async () => {
+    let promise = api.openPairIgnored();
+    // In-order delivery: a second, awaited call proves the first executed server-side before we
+    // release its answer -- which was never pulled, so the provider's return payload is disposed
+    // unserialized and disposeImpl() close()s the unsent socket.
+    expect(await api.pairOpened()).toBe(true);
+    promise[Symbol.dispose]();
+    expect(await api.waitForPairClose()).toMatchObject({ code: 1005 });
+  });
+
+  it("tunnels a speak-first server without losing the greeting", async () => {
+    let response = await api.openSpeakFirst();
+    let socket = response.webSocket;
+
+    let messages: string[] = [];
+    let gotBoth = new Promise<void>(resolve => {
+      socket.addEventListener("message", (event: any) => {
+        messages.push(event.data);
+        if (messages.length === 2) resolve();
+      });
+    });
+    socket.send("through-tunnel");
+    await gotBoth;
+    expect(messages).toEqual(["hello-first", "speak-first-echo:through-tunnel"]);
+
+    let closeEvent = nextEvent(socket, "close");
+    socket.close(1000, "done");
+    expect(await closeEvent).toMatchObject({ code: 1000, reason: "done" });
+  });
 });
 
 // Prove that a Cap'n Web session over a tunneled WebSocket behaves exactly like one over a
@@ -285,6 +435,50 @@ describe("Cap'n Web over a WebSocket obtained via fetch() over Cap'n Web", () =>
     await listening(innerServer);
 
     let gatewaySocket = new NodeWebSocket(`ws://127.0.0.1:${gatewayPort}`);
+    let gateway: any = newWebSocketRpcSession(gatewaySocket as any);
+    let response = await gateway.fetch(new Request("https://inner.example/rpc", {
+      headers: { Upgrade: "websocket" },
+    }));
+
+    let stub = newWebSocketRpcSession<TestTarget>(response.webSocket);
+    return {
+      stub,
+      async [Symbol.asyncDispose]() {
+        stub[Symbol.dispose]();
+        gatewaySocket.close();
+      },
+    };
+  });
+});
+
+// The same proof again, but with the gateway terminating the socket itself: one half of a
+// pure-JS WebSocketPair runs a nested Cap'n Web session, the other half is the upgrade answer.
+// Running the full battery through the pair proves the pair-backed tunnel is
+// transport-equivalent, exactly like the real-socket gateway above.
+describe("Cap'n Web over a WebSocketPair-backed upgrade Response", () => {
+  class PairGateway extends RpcTarget {
+    async fetch(request: Request): Promise<Response> {
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("Expected a WebSocket upgrade.", { status: 426 });
+      }
+      let pair = new WebSocketPair();
+      pair[1].accept();
+      newWebSocketRpcSession(pair[1] as any, new TestTarget());
+      return upgradeWebSocketResponse(pair[0]);
+    }
+  }
+
+  let gatewayServer = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  gatewayServer.on("connection", socket => {
+    newWebSocketRpcSession(socket as any, new PairGateway());
+  });
+
+  afterAll(async () => {
+    await closeServer(gatewayServer);
+  });
+
+  registerSessionTestBattery(async () => {
+    let gatewaySocket = new NodeWebSocket(`ws://127.0.0.1:${await listening(gatewayServer)}`);
     let gateway: any = newWebSocketRpcSession(gatewaySocket as any);
     let response = await gateway.fetch(new Request("https://inner.example/rpc", {
       headers: { Upgrade: "websocket" },
