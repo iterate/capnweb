@@ -1,6 +1,6 @@
 {
   "name": "@iterate-com/capnweb",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "description": "Iterate fork of capnweb — Cap'n Web RPC with WebSocket-over-RPC and server-side onCall observability",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

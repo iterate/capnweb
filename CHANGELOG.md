@@ -1,5 +1,15 @@
 # capnweb
 
+## 0.12.2
+
+### Patch Changes
+
+- [`e1b0f52`](https://github.com/iterate/capnweb/commit/e1b0f5259bd9c7f0b3feb2005252ea29bb29c956) Thanks [@jonastemplestein](https://github.com/jonastemplestein)! - Iterate fork release: WebSocket-over-RPC (upgrade Responses) and a server-side `onCall` per-call hook for observability. Published as `@iterate-com/capnweb` so dependents can pin the fork via package alias without colliding with upstream `capnweb`.
+
+- [`fe1b691`](https://github.com/iterate/capnweb/commit/fe1b691a7f55651f1adb3bb156d05c10a20b736f) Thanks [@jonastemplestein](https://github.com/jonastemplestein)! - Add `upgradeWebSocketResponse()` and a universal `WebSocketPair` -- the blessed way to answer a fetch with a WebSocket upgrade from any runtime. `upgradeWebSocketResponse(socket, init?)` spells "answer this fetch with this WebSocket" identically everywhere: on Cloudflare Workers it builds the native `new Response(null, { status: 101, webSocket })`, elsewhere a wire-equivalent status-200 Response carrying the socket (an upgrade's status is never serialized). The exported `WebSocketPair` is the native class on Workers and a workerd-faithful pure-JS pair elsewhere (halves born OPEN, unbounded buffering until `accept()`, strictly asynchronous delivery, RFC 6455 half-close, workerd's close-code validation and error messages), for providers that are themselves the endpoint or that wrap a speak-first upstream socket. Deliberate divergences from the native pair -- binary frames copied at `send()` (native aliases the buffer), plain-object events, delivery surviving a throwing listener, and close handshakes always completing with the responder's real code/reason (native can report a 1006 disconnect when data interleaves with the handshake) -- are documented on the `WebSocketPair` docstring. The `WebSocketLike` interface the tunnel accepts is now exported too.
+
+  Also fixes a latent close-path gap in the WebSocket tunnel itself: a close initiated on the tunneled side is now completed at the sender's edge by echoing the final close record back through the readable. Previously the tunnel waited for the wrapped socket's own close event, which a socket never fires for its own `close()` -- so closing a tunneled socket answered by a Cloudflare Workers provider hung at CLOSING forever. For passthrough sockets the echoed close now carries the closing client's own code rather than the far server's eventual ack. Relatedly, an upgrade `Response` that is returned but never touched by the receiver now releases its socket on every platform: the disposer accepts before closing, which native Workers sockets require.
+
 ## 0.12.1
 
 ### Patch Changes
