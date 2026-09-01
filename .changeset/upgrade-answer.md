@@ -1,5 +1,5 @@
 ---
-"@iterate-com/capnweb": minor
+"@iterate-com/capnweb": patch
 ---
 
 Add `upgradeWebSocketResponse()` and a universal `WebSocketPair` -- the blessed way to answer a fetch with a WebSocket upgrade from any runtime. `upgradeWebSocketResponse(socket, init?)` spells "answer this fetch with this WebSocket" identically everywhere: on Cloudflare Workers it builds the native `new Response(null, { status: 101, webSocket })`, elsewhere a wire-equivalent status-200 Response carrying the socket (an upgrade's status is never serialized). The exported `WebSocketPair` is the native class on Workers and a workerd-faithful pure-JS pair elsewhere (halves born OPEN, unbounded buffering until `accept()`, strictly asynchronous delivery, RFC 6455 half-close, workerd's close-code validation and error messages), for providers that are themselves the endpoint or that wrap a speak-first upstream socket. Deliberate divergences from the native pair -- binary frames copied at `send()` (native aliases the buffer), plain-object events, delivery surviving a throwing listener, and close handshakes always completing with the responder's real code/reason (native can report a 1006 disconnect when data interleaves with the handshake) -- are documented on the `WebSocketPair` docstring. The `WebSocketLike` interface the tunnel accepts is now exported too.
