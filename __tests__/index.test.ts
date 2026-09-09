@@ -3130,6 +3130,26 @@ describe("transport encoding levels", () => {
 });
 
 describe("ReadableStream over RPC", () => {
+  it("cancels an idle source when its RPC session disconnects", async () => {
+    const cancelled = Promise.withResolvers<unknown>();
+    class StreamProvider extends RpcTarget {
+      getStream() {
+        return new ReadableStream<string>({
+          start(controller) { controller.enqueue("first"); },
+          cancel(reason) { cancelled.resolve(reason); },
+        });
+      }
+    }
+    // The normal harness disposer expects live connections; this test ends both sessions.
+    const harness = new TestHarness(new StreamProvider());
+    const stream = await harness.stub.getStream();
+    const reader = stream.getReader();
+    expect(await reader.read()).toEqual({ done: false, value: "first" });
+    harness.serverTransport.forceReceiveError(new Error("test disconnect"));
+    expect(await cancelled.promise).toEqual(new Error("test disconnect"));
+    reader.releaseLock();
+  });
+
   it("cancels an idle remote source without waiting for another chunk", async () => {
     let cancelled = Promise.withResolvers<unknown>();
     class StreamProvider extends RpcTarget {

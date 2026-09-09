@@ -737,7 +737,7 @@ class RpcSessionImpl implements Importer, Exporter {
     const writer = writable.getWriter();
     // Some Workers runtimes do not cancel an idle source when pipeTo's destination
     // errors (even with an AbortSignal). Own the reader so peer failure can cancel it.
-    hook.onBroken(error => { reader.cancel(error).catch(() => {}); });
+    writer.closed.catch(error => { reader.cancel(error).catch(() => {}); });
     const pump = async () => {
       try {
         for (;;) {
