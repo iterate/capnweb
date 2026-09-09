@@ -2165,6 +2165,17 @@ describe("error serialization", () => {
 });
 
 describe("onRpcBroken", () => {
+  it("releases broken callbacks when their last stub is disposed", async () => {
+    const harness = new TestHarness(new TestTarget());
+    const stub = await harness.stub.makeCounter(0);
+    const errors: unknown[] = [];
+    stub.onRpcBroken(error => errors.push(error));
+    stub[Symbol.dispose]();
+    harness.clientTransport.forceReceiveError(new Error("disconnected"));
+    await pumpMicrotasks();
+    expect(errors).toEqual([]);
+  });
+
   it("signals when the connection is lost", async () => {
     class TestBroken extends RpcTarget {
       getValue() { return 42; }
@@ -3119,6 +3130,24 @@ describe("transport encoding levels", () => {
 });
 
 describe("ReadableStream over RPC", () => {
+  it("cancels an idle remote source without waiting for another chunk", async () => {
+    let cancelled = Promise.withResolvers<unknown>();
+    class StreamProvider extends RpcTarget {
+      getStream() {
+        return new ReadableStream<string>({
+          start(controller) { controller.enqueue("first"); },
+          cancel(reason) { cancelled.resolve(reason); },
+        });
+      }
+    }
+    await using harness = new TestHarness(new StreamProvider());
+    const stream = await harness.stub.getStream();
+    const reader = stream.getReader();
+    expect(await reader.read()).toEqual({ done: false, value: "first" });
+    await reader.cancel("finished");
+    expect(await cancelled.promise).toBe("finished");
+  });
+
   it("can send a ReadableStream and read all chunks", async () => {
     let stream = new ReadableStream<string>({
       start(controller) {
@@ -3530,6 +3559,29 @@ describe("ReadableStream over RPC", () => {
 // =======================================================================================
 
 describe("Fetch API types over RPC", () => {
+  it.each([
+    { state: "consumed", viaCallback: false },
+    { state: "locked", viaCallback: false },
+    { state: "consumed", viaCallback: true },
+    { state: "locked", viaCallback: true },
+  ])("rejects a $state Response (callback=$viaCallback) without breaking its session", async ({ state, viaCallback }) => {
+    const getResponse = async () => {
+      const response = new Response("test-body");
+      if (state === "consumed") await response.text();
+      else response.body!.getReader();
+      return response;
+    };
+    class ResponseProvider extends RpcTarget {
+      getResponse() { return getResponse(); }
+      call(callback: () => Promise<Response>) { return callback(); }
+      ping() { return "healthy"; }
+    }
+    await using harness = new TestHarness(new ResponseProvider());
+    using call = viaCallback ? harness.stub.call(getResponse) : harness.stub.getResponse();
+    await expect(call).rejects.toThrow();
+    expect(await harness.stub.ping()).toBe("healthy");
+  });
+
   it("can send Headers over RPC", async () => {
     class HeaderServer extends RpcTarget {
       getHeaders() {

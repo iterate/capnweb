@@ -255,6 +255,10 @@ class ImportTableEntry {
     if (this.resolution) {
       this.resolution.dispose();
     } else {
+      if (this.onBrokenRegistrations) {
+        for (const index of this.onBrokenRegistrations) delete this.session.onBrokenCallbacks[index];
+        this.onBrokenRegistrations = undefined;
+      }
       this.abort(new Error("RPC was canceled because the RpcPromise was disposed."));
       this.sendRelease();
     }
@@ -729,11 +733,30 @@ class RpcSessionImpl implements Importer, Exporter {
     // Create a proxy WritableStream from the import hook and pump the ReadableStream into it.
     let hook = new RpcImportHook(/*isPromise=*/false, entry);
     let writable = streamImpl.createWritableStreamFromHook(hook);
-    readable.pipeTo(writable).catch(() => {
-      // Errors are handled by the writable stream's error handling -- either the write fails
-      // and the writable side reports it, or the readable side errors and pipeTo aborts the
-      // writable side. Either way, the hook's disposal will handle cleanup.
-    }).finally(() => readableHook.dispose());
+    const reader = readable.getReader();
+    const writer = writable.getWriter();
+    // Some Workers runtimes do not cancel an idle source when pipeTo's destination
+    // errors (even with an AbortSignal). Own the reader so peer failure can cancel it.
+    hook.onBroken(error => { reader.cancel(error).catch(() => {}); });
+    const pump = async () => {
+      try {
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          await writer.write(chunk.value);
+        }
+        await writer.close();
+      } catch (error) {
+        // Initiate both ends' cleanup without waiting for an arbitrary user cancel callback.
+        void reader.cancel(error).catch(() => {});
+        void writer.abort(error).catch(() => {});
+      } finally {
+        reader.releaseLock();
+        writer.releaseLock();
+        readableHook.dispose();
+      }
+    };
+    void pump();
 
     return importId;
   }
@@ -1064,7 +1087,15 @@ class RpcSessionImpl implements Importer, Exporter {
             // ["readable", importId].
             let { readable, writable } = new TransformStream();
             let hook = streamImpl.createWritableStreamHook(writable);
-            this.exports.push({ hook, refcount: 1, pipeReadable: readable });
+            const exportId = this.exports.length;
+            const entry = { hook, refcount: 1, pipeReadable: readable };
+            this.exports.push(entry);
+            hook.onBroken(error => {
+              // Cancellation must reach an idle source, not wait for its next write.
+              if (this.abortReason || this.exports[exportId] !== entry) return;
+              this.send(["reject", exportId,
+                Devaluator.devaluate(error, undefined, this, undefined, this.encodingLevel)]);
+            });
             continue;
           }
 
