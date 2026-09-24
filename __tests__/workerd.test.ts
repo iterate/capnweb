@@ -5,9 +5,13 @@
 /// <reference types="@cloudflare/workers-types" />
 import { expect, it, describe } from "vitest";
 import { RpcStub as NativeRpcStub, RpcTarget as NativeRpcTarget, env, DurableObject } from "cloudflare:workers";
-import { newHttpBatchRpcSession, newWebSocketRpcSession, RpcStub, RpcPromise, RpcTarget } from "../src/index-workers.js";
+// Cap'n Web's WebSocketPair export is imported under an alias so that the bare `WebSocketPair`
+// references in the tests below keep pinning the raw native global spelling.
+import { newHttpBatchRpcSession, newWebSocketRpcSession, RpcStub, RpcPromise, RpcTarget,
+         upgradeWebSocketResponse, WebSocketPair as CapnwebWebSocketPair }
+    from "../src/index-workers.js";
 import { v, wrapServerTarget, type ServiceValidator } from "../packages/capnweb-validate/src/internal/core.js";
-import { Counter, TestTarget } from "./test-util.js";
+import { Counter, DeviceEchoTarget, TestTarget } from "./test-util.js";
 
 class JsCounter extends RpcTarget {
   constructor(private i: number = 0) {
@@ -301,6 +305,137 @@ interface WorkerdTestTarget extends TestTarget {
 }
 
 describe("workerd RPC server", () => {
+  it("can return a WebSocket upgrade Response over RPC", async () => {
+    class WebSocketResponseTarget extends RpcTarget {
+      openEcho() {
+        let pair = new WebSocketPair();
+        pair[1].accept();
+        pair[1].addEventListener("message", event => pair[1].send(event.data));
+        return new Response(null, { status: 101, webSocket: pair[0] });
+      }
+    }
+
+    let pair = new WebSocketPair();
+    pair[0].accept();
+    pair[1].accept();
+    let api: any = newWebSocketRpcSession(pair[0]);
+    newWebSocketRpcSession(pair[1], new WebSocketResponseTarget());
+
+    // On workerd, the received Response holds a native WebSocket, suitable for completing a real
+    // HTTP upgrade (e.g. by returning the Response from a fetch handler).
+    let response: Response = await api.openEcho();
+    expect(response.status).toBe(101);
+    let socket = response.webSocket;
+    expect(socket).toBeTruthy();
+
+    socket!.accept();
+    let message = new Promise(resolve => {
+      socket!.addEventListener("message", event => resolve(event.data), { once: true });
+    });
+    socket!.send("hello over Response.webSocket");
+
+    expect(await message).toBe("hello over Response.webSocket");
+    socket!.close();
+  });
+
+  it("exports the native WebSocketPair on workerd", () => {
+    // On workerd, Cap'n Web's WebSocketPair is the native class itself (aliased at module
+    // load), so there is exactly one pair behavior per platform.
+    expect(CapnwebWebSocketPair).toBe((globalThis as any).WebSocketPair);
+  });
+
+  it("answers an upgrade via upgradeWebSocketResponse() with a genuine 101 and native socket",
+      async () => {
+    // The provider is the shared DeviceEchoTarget from test-util.ts -- the exact same source
+    // runs under Node in websocket-tunnel.test.ts, over the pure-JS pair. Here, on workerd,
+    // upgradeWebSocketResponse() must produce the real thing: status 101 and a native
+    // WebSocket, suitable for completing an actual HTTP upgrade.
+    let pair = new WebSocketPair();
+    pair[0].accept();
+    pair[1].accept();
+    let api: any = newWebSocketRpcSession(pair[0]);
+    newWebSocketRpcSession(pair[1], new DeviceEchoTarget());
+
+    let response: Response = await api.openDeviceEcho();
+    expect(response.status).toBe(101);
+    let socket = response.webSocket;
+    expect(socket).toBeInstanceOf(WebSocket);
+
+    socket!.accept();
+    let message = new Promise(resolve => {
+      socket!.addEventListener("message", event => resolve(event.data), { once: true });
+    });
+    socket!.send("hello");
+    expect(await message).toBe("device-echo:hello");
+
+    // The close round trip -- the same assertions as the Node twin (websocket-tunnel.test.ts).
+    // The tunnel edge completes a client-initiated close by echoing the close record back, since
+    // a native pair half would otherwise stay CLOSING. The receive path relays the echo onto the
+    // native pair backing this socket, so the client hears its own code/reason back.
+    let closeEvent = new Promise<any>(resolve => {
+      socket!.addEventListener("close", event => resolve(event), { once: true });
+    });
+    socket!.close(1000, "done");
+    let event = await closeEvent;
+    expect(event.code).toBe(1000);
+    expect(event.reason).toBe("done");
+    // The half reads CLOSED once its close event has dispatched.
+    for (let i = 0; i < 100 && socket!.readyState !== 3; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(socket!.readyState).toBe(3);  // CLOSED
+  });
+
+  it("builds a genuine 101 Response carrying the given native socket, without any RPC", () => {
+    // Directly pins the docstring's flagship claim -- on Workers, upgradeWebSocketResponse()
+    // produces exactly the native `new Response(null, { status: 101, webSocket })`, suitable
+    // for completing a real HTTP upgrade. This can't be proven through an RPC round trip: the
+    // receive path always rebuilds a native 101 regardless of what the sender constructed, so
+    // only a direct look at the constructed Response pins the platform branch.
+    let pair = new WebSocketPair();
+    let response = upgradeWebSocketResponse(pair[0]);
+    expect(response.status).toBe(101);
+    expect(response.webSocket).toBe(pair[0]);
+  });
+
+  it("closes the provider's kept half when a returned Response is never touched", async () => {
+    // The workerd twin of the Node release-on-ignore test: when the caller never pulls the
+    // answer, disposeImpl's accept-then-close of the unsent half must notify the kept half on
+    // the native pair too. (close() before accept() throws on workerd, which is exactly why
+    // disposeImpl accepts first.)
+    class PairIgnoredTarget extends RpcTarget {
+      pairCloseEvent?: Promise<any>;
+      openPairIgnored(): Response {
+        let pair = new WebSocketPair();
+        pair[1].accept();
+        this.pairCloseEvent = new Promise(resolve => {
+          pair[1].addEventListener("close", event => resolve(event), { once: true });
+        });
+        return upgradeWebSocketResponse(pair[0]);
+      }
+      pairOpened(): boolean {
+        return this.pairCloseEvent !== undefined;
+      }
+      async waitForPairClose(): Promise<unknown> {
+        let event: any = await this.pairCloseEvent;
+        return { code: event.code, reason: event.reason };
+      }
+    }
+
+    let pair = new WebSocketPair();
+    pair[0].accept();
+    pair[1].accept();
+    let api: any = newWebSocketRpcSession(pair[0]);
+    newWebSocketRpcSession(pair[1], new PairIgnoredTarget());
+
+    let promise = api.openPairIgnored();
+    // In-order delivery: a second, awaited call proves the first executed server-side before
+    // we release its never-pulled answer.
+    expect(await api.pairOpened()).toBe(true);
+    promise[Symbol.dispose]();
+    expect(await api.waitForPairClose()).toMatchObject({ code: 1005 });
+  });
+
   it("can accept WebSocket RPC connections", async () => {
     let resp = await (<Env>env).testServer.fetch("http://foo", {headers: {Upgrade: "websocket"}});
     let ws = resp.webSocket;

@@ -2,7 +2,7 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl } from "./core.js";
+import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl, type RpcCallInfo } from "./core.js";
 import { serialize, deserialize, EncodingLevel } from "./serialize.js";
 import { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
 import { RpcLimits, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH } from "./serialize.js";
@@ -15,15 +15,17 @@ import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
 import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
 import { forceInitMap } from "./map.js";
 import { forceInitStreams } from "./streams.js";
+import { upgradeWebSocketResponse, WebSocketPair, type WebSocketLike } from "./websocket-streams.js";
 
 forceInitMap();
 forceInitStreams();
 
 // Re-export public API types.
 export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
-         nodeHttpBatchRpcResponse, WebSocketTransport, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH };
-export type { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport,
-         RpcSessionOptions, RpcCompatible, EncodingLevel, RpcLimits };
+         nodeHttpBatchRpcResponse, WebSocketTransport, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH,
+         upgradeWebSocketResponse, WebSocketPair };
+export type { RpcCallInfo, RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport,
+         RpcSessionOptions, RpcCompatible, EncodingLevel, RpcLimits, WebSocketLike };
 
 // Hack the type system to make RpcStub's types work nicely!
 /**

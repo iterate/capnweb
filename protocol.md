@@ -215,9 +215,13 @@ At this time, `init.signal` is not supported and must not be sent, though that w
 
 `["response", body, init]`
 
-A `Response` object from the Fetch API. `body` and `init` are the parameters to pass to `Response`'s constructor to create the desired `Response` instance. `body` is an expression which must evaluate to `null`, a string, `UInt8Array`, or `ReadableStream`. `init.headers`, if present, must contain an array of pairs, suitable to pass to the constructor of `Headers`. Other properties of `init` must be plain values; they will not be evaluated as expressions before passing to the `Response` constructor.
+A `Response` object from the Fetch API. `body` and `init` are the parameters to pass to `Response`'s constructor to create the desired `Response` instance. `body` is an expression which must evaluate to `null`, a string, `UInt8Array`, or `ReadableStream`. `init.headers`, if present, must contain an array of pairs, suitable to pass to the constructor of `Headers`. Other properties of `init`, except for `webSocket` (below), must be plain values; they will not be evaluated as expressions before passing to the `Response` constructor.
 
-At this time, `init.webSocket` (a Cloudflare Workers extension) is not supported and must not be sent, though that may change if `WebSocket` gains support for serialization.
+In the Iterate fork, `init.webSocket` is sent when the `Response` has a `webSocket` property -- a Cloudflare Workers extension indicating a response that completed an HTTP/WebSocket upgrade. (Bare `WebSocket` objects are not serializable.) `body` is then `null`, and `init` contains neither `status` nor `statusText`: the upgrade implies status 101, though a receiver whose `Response` constructor cannot represent 1xx statuses may use a default status.
+
+`init.webSocket` has the form `{"readable": <expression>, "writable": <expression>}`, representing the socket as a pair of streams using the regular stream serialization. `readable` evaluates to a `ReadableStream` of the messages arriving on the sender's socket, and `writable` to a `WritableStream` of messages to send on it. The sender begins streaming messages as soon as it serializes the `Response`.
+
+Each chunk on either stream is a message: a string for a text frame, or a `Uint8Array` for a binary frame. A final chunk of the form `{"close": {"code": <number>, "reason": <string>}}` conveys closure of the socket. A stream that ends without a close chunk indicates closure without a status (as if code 1005), and an aborted stream indicates the socket failed. Canceling the readable or aborting the writable tells the sender to close the socket; a receiver that never uses the socket should release both streams.
 
 `["import", importId, propertyPath, callArguments]`
 `["pipeline", importId, propertyPath, callArguments]`

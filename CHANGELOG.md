@@ -1,5 +1,23 @@
 # capnweb
 
+## 0.12.3
+
+### Patch Changes
+
+- [#9](https://github.com/iterate/capnweb/pull/9) [`fc68b9c`](https://github.com/iterate/capnweb/commit/fc68b9cf214ce8b0ab0ef8c3c4136934c27cad6c) Thanks [@jonastemplestein](https://github.com/jonastemplestein)! - Fix WebSocket tunnel lifecycle and `onCall` ownership.
+
+  - Tunneled sockets flush queued messages and their close before release, copy binary sends, and
+    deliver binary messages as exactly-sized `ArrayBuffer`s instead of `Uint8Array`s. A throwing
+    listener no longer fails the tunnel. Close codes such as 1001 and 1011 are preserved where the
+    runtime allows. A socket can no longer be sent in two separate calls. Tunnels no longer retain a
+    session callback after they close.
+  - `onCall` must call `invoke()` synchronously and exactly once, and return its result. Otherwise
+    the call rejects; previously a hook that awaited before invoking still ran the application.
+    Arguments are released when a hook rejects without invoking, and the result is released when a
+    hook fails after invoking.
+  - Stream flow control ignores zero-length round trips from coarse clocks, which could otherwise
+    block a writer forever.
+
 ## 0.12.0
 
 ### Minor Changes

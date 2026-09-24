@@ -11,6 +11,8 @@ on:
     workflows: ["Test"]
     branches: [main]
     types: [completed]
+  push:
+    tags: ["v*"] # Iterate fork releases; see the fork-* jobs below.
 
 jobs:
   release:
@@ -87,3 +89,37 @@ jobs:
         run: npx tsx .github/version-script.ts
 
       - run: npm publish --tag beta
+
+  # Iterate fork: publish @iterate-com/capnweb when a version tag is pushed.
+  fork-test:
+    if: ${{ github.event_name == 'push' && github.repository == 'iterate/capnweb' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/test.yml
+
+  fork-publish:
+    needs: fork-test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          registry-url: https://registry.npmjs.org
+
+      - name: Check the tag matches package.json
+        run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} # optional with trusted publishing

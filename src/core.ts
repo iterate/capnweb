@@ -214,6 +214,21 @@ export type StreamImpl = {
   createReadableStreamHook(stream: ReadableStream): StubHook;
 }
 
+/** Information about one application function invocation received over RPC. */
+export type RpcCallInfo = {
+  /** The property path used to reach the function from the referenced capability. */
+  path: PropertyPath;
+  /** The object that owns the function, or the function itself for a callable capability. */
+  target: unknown;
+};
+
+/**
+ * Wraps one local application invocation. Call `invoke()` synchronously (to preserve e-order) and
+ * exactly once, and return its result; the returned promise spans the full call. Throwing before
+ * invoking rejects the call and releases its arguments.
+ */
+export type RpcCallHandler = <T>(info: RpcCallInfo, invoke: () => Promise<T>) => Promise<T>;
+
 // Inner interface backing an RpcStub or RpcPromise.
 //
 // A hook may eventually resolve to a "payload".
@@ -852,8 +867,9 @@ export class RpcPayload {
   // When done, the payload takes ownership of the final value and all the stubs within. It may
   // modify the value in preparation for delivery, and may deliver the value directly to the app
   // without copying.
-  public static forEvaluate(hooks: StubHook[], promises: LocatedPromise[]) {
-    return new RpcPayload(null, "owned", hooks, promises);
+  public static forEvaluate(
+      hooks: StubHook[], promises: LocatedPromise[], callHandler?: RpcCallHandler) {
+    return new RpcPayload(null, "owned", hooks, promises, callHandler);
   }
 
   // Deep-copy the given value, including dup()ing all stubs.
@@ -893,15 +909,19 @@ export class RpcPayload {
 
     // All promises found in `value`. The locations of each promise are provided to allow
     // substitutions later.
-    private promises?: LocatedPromise[]
+    private promises?: LocatedPromise[],
+
+    // The session's onCall hook, carried by received call arguments so that it survives while a
+    // promise-pipelined target resolves.
+    public callHandler?: RpcCallHandler
   ) {}
 
-  // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets
-  // or WritableStreams found in the payload at the time that it is serialized (or deep-copied) for
-  // return, so that we can make sure they are not disposed before the pipeline ends.
+  // For `source === "return"` payloads only, this tracks any StubHooks created around RpcTargets,
+  // streams, or WebSockets found in the payload at the time that it is serialized (or deep-copied)
+  // for return, so that we can make sure they are not disposed before the pipeline ends.
   //
   // This is initialized on first use.
-  private rpcTargets?: Map<RpcTarget | Function | WritableStream | ReadableStream, StubHook>;
+  private rpcTargets?: Map<object, StubHook>;
 
   // Get the StubHook representing the given RpcTarget found inside this payload.
   public getHookForRpcTarget(target: RpcTarget | Function, parent: object | undefined,
@@ -1031,6 +1051,37 @@ export class RpcPayload {
     } else {
       throw new Error("owned payload shouldn't contain raw ReadableStreams");
     }
+  }
+
+  // Get the StubHook representing the WebSocket of an upgrade Response found inside this payload.
+  // `makeHook` wraps the socket in a stream pair (see websocket-streams.ts) and returns the hook
+  // for the writable half; the caller pipes the readable half itself.
+  public getHookForWebSocket(webSocket: object, makeHook: () => StubHook): StubHook {
+    if (this.source === "params") {
+      return makeHook();
+    } else if (this.source === "return") {
+      // Track the hook like getHookForRpcTarget() does, so that it survives until the pipeline
+      // ends and disposeImpl() / deepCopy() can account for it.
+      let hook = makeHook();
+      if (!this.rpcTargets) {
+        this.rpcTargets = new Map;
+      }
+      this.rpcTargets.set(webSocket, hook);
+      return hook.dup();
+    } else {
+      throw new Error("owned payload shouldn't contain raw WebSockets");
+    }
+  }
+
+  // Like the getHookFor*() methods with respect to `dupStubs`, but never creates a hook: wrapping a
+  // socket has side effects that would break a socket that is merely being delivered locally.
+  public getExistingHookForWebSocket(webSocket: object, dupStubs: boolean): StubHook | undefined {
+    let hook = this.rpcTargets?.get(webSocket);
+    if (hook && !dupStubs) {
+      this.rpcTargets!.delete(webSocket);
+      return hook;
+    }
+    return hook?.dup();
   }
 
   private deepCopy(
@@ -1175,7 +1226,17 @@ export class RpcPayload {
         // Make an actual copy of the object, e.g. so the headers are copied.
         // Note that it would be incorrect to use clone() here since that would tee() the body
         // stream.
-        return new Response(resp.body, resp);
+        let result = new Response(resp.body, resp);
+
+        let webSocket = (<any>resp).webSocket;
+        if (webSocket) {
+          // A WebSocket upgrade Response (Cloudflare Workers extension). Like a body stream, the
+          // socket is shared, but if serialization already tunneled it, the copy takes that hook.
+          let hook = owner?.getExistingHookForWebSocket(webSocket, dupStubs);
+          if (hook) this.hooks!.push(hook);
+          Object.defineProperty(result, "webSocket", { value: webSocket, configurable: true });
+        }
+        return result;
       }
 
       default:
@@ -1501,7 +1562,21 @@ export class RpcPayload {
         // The body may be a ReadableStream that has an associated hook in rpcTargets.
         let resp = <Response>value;
         if (resp.body) this.disposeImpl(resp.body, resp);
-        // TODO: When we support WebSocket, we may need to dispose response.webSocket here?
+
+        let webSocket = (<any>resp).webSocket;
+        let hook = webSocket && this.rpcTargets?.get(webSocket);
+        if (hook) {
+          // Serialization tunneled this socket. If the receiver imported it, its dup keeps the
+          // socket alive.
+          this.rpcTargets!.delete(webSocket);
+          hook.dispose();
+        } else if (webSocket) {
+          // The Response was never serialized, so nobody can receive this socket; close it.
+          // Workers sockets (including WebSocketPair halves) refuse close() before accept(), and
+          // some refuse accept() but still honor close(), hence separate try blocks.
+          try { webSocket.accept?.(); } catch {}
+          try { webSocket.close(); } catch {}
+        }
         return;
       }
 
@@ -1776,6 +1851,39 @@ function followPath(value: unknown, parent: object | undefined,
   };
 }
 
+// Delivers a call through the session's onCall hook (see RpcCallHandler), enforcing its contract.
+// `args` is released if the hook never invokes, and the application's result is released if the
+// hook fails to return it.
+function deliverCallWithHandler(args: RpcPayload, path: PropertyPath, func: Function,
+                                thisArg: object | undefined): Promise<RpcPayload> {
+  let invocation: Promise<RpcPayload> | undefined;
+  let inHandler = true;
+  let wrapped: Promise<RpcPayload>;
+  try {
+    wrapped = Promise.resolve(args.callHandler!({ path: [...path], target: thisArg ?? func }, () => {
+      if (!inHandler || invocation) {
+        throw new TypeError("onCall must invoke synchronously and only once.");
+      }
+      invocation = args.deliverCall(func, thisArg);
+      invocation.catch(() => {});  // The hook may fail without observing it.
+      return invocation;
+    }));
+  } catch (err) {
+    wrapped = Promise.reject(err);
+  }
+  inHandler = false;
+  if (!invocation) args.dispose();
+
+  let result = wrapped.then(async payload => {
+    if (!invocation || payload !== await invocation) {
+      throw new TypeError("onCall must return the result of invoke().");
+    }
+    return payload;
+  });
+  result.catch(() => invocation?.then(payload => payload.dispose(), () => {}));
+  return result;
+}
+
 // Shared base class for PayloadStubHook and TargetStubHook.
 abstract class ValueStubHook extends StubHook {
   protected abstract getValue(): {value: unknown, owner: RpcPayload | null};
@@ -1804,7 +1912,9 @@ abstract class ValueStubHook extends StubHook {
 
     // deliverCall() is async and disposes `args` itself when the call completes, so it never
     // needs a guard here.
-    let promise = args.deliverCall(followResult.value, followResult.parent);
+    let promise = args.callHandler
+        ? deliverCallWithHandler(args, path, followResult.value, followResult.parent)
+        : args.deliverCall(followResult.value, followResult.parent);
     return new PromiseStubHook(promise.then(payload => {
       return new PayloadStubHook(payload);
     }));

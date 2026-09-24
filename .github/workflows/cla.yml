@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   CLAssistant:
+    if: github.repository_owner == 'cloudflare'
     runs-on: ubuntu-latest
     steps:
       - name: "Validate changesets release PR"
