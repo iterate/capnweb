@@ -233,6 +233,9 @@ export class FlowController {
 
     // Update RTT estimate.
     let rtt = ackTime - token.sentTime;
+    // A coarse clock can report a zero round trip, which can't estimate bandwidth (and would make
+    // the window NaN, blocking the sender forever). Acks still free capacity.
+    if (rtt <= 0) return this.bytesInFlight < this.window;
     this.minRtt = Math.min(this.minRtt, rtt);
 
     // Update bandwidth estimate and window.

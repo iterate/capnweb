@@ -2,7 +2,8 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook } from "./core.js";
+import { StubHook, RpcPayload, typeForRpc, RpcStub, RpcPromise, LocatedPromise, RpcTarget, unwrapStubAndPath, streamImpl, PromiseStubHook, PayloadStubHook, type RpcCallHandler } from "./core.js";
+import { webSocketToStreams, makeUpgradeResponse } from "./websocket-streams.js";
 
 export type ImportId = number;
 export type ExportId = number;
@@ -480,6 +481,9 @@ export class Devaluator {
 
       case "response": {
         let resp = <Response>value;
+        if ((resp as any).webSocket && resp.body) {
+          throw new TypeError("A WebSocket upgrade Response can't have a body.");
+        }
         let body = this.devaluateImpl(resp.body, resp, depth + 1);
         let init: Record<string, unknown> = {};
 
@@ -501,8 +505,27 @@ export class Devaluator {
           init.encodeBody = cfResp.encodeBody;
         }
         if (cfResp.webSocket) {
-          // As of this writing, we don't support WebSocket, but we might someday.
-          throw new TypeError("Can't serialize a Response containing a webSocket.");
+          // A completed WebSocket upgrade, sent as a pair of streams; see websocket-streams.ts.
+          // The upgrade implies status 101, which standard Response constructors can't produce,
+          // so status is not sent.
+          if (!this.source) {
+            throw new Error("Can't serialize a WebSocket upgrade in this context.");
+          }
+          delete init.status;
+          delete init.statusText;
+
+          // Like a ReadableStream, the socket's messages start flowing through a pipe immediately.
+          let readableId!: ImportId;
+          let hook = this.source.getHookForWebSocket(cfResp.webSocket, () => {
+            let streams = webSocketToStreams(cfResp.webSocket);
+            readableId = this.exporter.createPipe(
+                streams.readable, streamImpl.createReadableStreamHook(streams.readable));
+            return streamImpl.createWritableStreamHook(streams.writable);
+          });
+          init.webSocket = {
+            readable: ["readable", readableId],
+            writable: this.devaluateHook("writable", hook),
+          };
         }
 
         return ["response", body, init];
@@ -771,7 +794,8 @@ function streamToBlobPromise(stream: ReadableStream, type: string): RpcPromise {
 export class Evaluator {
   private limits: RpcLimits;
 
-  constructor(private importer: Importer, private encodingLevel: EncodingLevel = "string") {
+  constructor(private importer: Importer, private encodingLevel: EncodingLevel = "string",
+              private callHandler?: RpcCallHandler) {
     this.limits = importer.getLimits();
   }
 
@@ -783,7 +807,7 @@ export class Evaluator {
   }
 
   private evaluateWithDepth(value: unknown, depth: number): RpcPayload {
-    let payload = RpcPayload.forEvaluate(this.hooks, this.promises);
+    let payload = RpcPayload.forEvaluate(this.hooks, this.promises, this.callHandler);
     try {
       payload.value = this.evaluateImpl(value, payload, "value", depth);
       return payload;
@@ -1030,17 +1054,35 @@ export class Evaluator {
           let init = value[2];
           if (typeof init !== "object" || init === null) break;
 
-          // Evaluate specific properties which are expected to contain non-trivial types.
-          if (init.webSocket) {
-            // `response.webSocket` is a Cloudflare Workers extension. Not (yet?) supported for
-            // serialization.
-            throw new TypeError("Can't deserialize a Response containing a webSocket.");
-          }
-
           // Type-check `headers` is an array because the constructor allows multiple
           // representations and we don't want to allow the others.
           if (init.headers && !(init.headers instanceof Array)) {
             throw new TypeError("Request headers must be serialized as an array of pairs.");
+          }
+
+          // Evaluate specific properties which are expected to contain non-trivial types.
+          if (init.webSocket) {
+            // `response.webSocket` is a Cloudflare Workers extension: a completed WebSocket
+            // upgrade, sent as a pair of streams. See websocket-streams.ts.
+            let ws = init.webSocket;
+            let writable = ws.writable;
+            if (body !== null || typeof ws !== "object" || !(writable instanceof Array) ||
+                writable.length !== 2 || writable[0] !== "writable" ||
+                typeof writable[1] !== "number") {
+              throw new TypeError("Invalid WebSocket upgrade Response.");
+            }
+            let readable = this.evaluateImpl(ws.readable, ws, "readable", depth + 1);
+            if (!(readable instanceof ReadableStream)) {
+              throw new TypeError("Invalid WebSocket upgrade Response.");
+            }
+
+            // Import the writable's hook directly rather than as a WritableStream: the received
+            // socket manages the hook's lifetime itself (see TunneledWebSocket).
+            let writableHook = this.importer.importStub(writable[1]);
+            this.hooks.push(writableHook);
+
+            delete init.webSocket;
+            return makeUpgradeResponse(readable, writableHook, init as ResponseInit);
           }
 
           return new Response(body as BodyInit | null, init as ResponseInit);
@@ -1136,7 +1178,7 @@ export class Evaluator {
           }
 
           // We need a new evaluator for the args, to build a separate payload.
-          let subEval = new Evaluator(this.importer);
+          let subEval = new Evaluator(this.importer, undefined, this.callHandler);
           args = subEval.evaluateWithDepth([args], depth);
 
           return addStub(hook.call(path, args));

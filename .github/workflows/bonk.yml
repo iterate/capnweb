@@ -13,6 +13,7 @@ concurrency:
 jobs:
   bonk:
     if: >-
+      github.repository_owner == 'cloudflare' &&
       github.event.sender.type != 'Bot' &&
       (contains(github.event.comment.body, '/bonk') || contains(github.event.comment.body, '@ask-bonk')) &&
       (

@@ -1485,6 +1485,123 @@ describe("capability-passing", () => {
   });
 });
 
+describe("onCall", () => {
+  it("wraps pipelined application calls for their full lifetime", async () => {
+    const gate = Promise.withResolvers<void>();
+    const events: Array<{phase: "start" | "end", path: string, target: string}> = [];
+
+    class ChildTarget extends RpcTarget {
+      async waitForGate(value: string) {
+        await gate.promise;
+        return value;
+      }
+    }
+
+    class RootTarget extends RpcTarget {
+      child() {
+        return new ChildTarget();
+      }
+    }
+
+    await using harness = new TestHarness(new RootTarget(), {
+      onCall: async (info, invoke) => {
+        const event = {
+          path: info.path.join("."),
+          target: (info.target as object).constructor.name,
+        };
+        events.push({phase: "start", ...event});
+        try {
+          return await invoke();
+        } finally {
+          events.push({phase: "end", ...event});
+        }
+      },
+    });
+
+    using child = harness.stub.child();
+    using pending = child.waitForGate("done");
+    await pumpMicrotasks();
+
+    expect(events).toEqual([
+      {phase: "start", path: "child", target: "RootTarget"},
+      {phase: "end", path: "child", target: "RootTarget"},
+      {phase: "start", path: "waitForGate", target: "ChildTarget"},
+    ]);
+
+    gate.resolve();
+    expect(await pending).toBe("done");
+    expect(events.at(-1)).toEqual({phase: "end", path: "waitForGate", target: "ChildTarget"});
+  });
+
+  it("releases arguments when an async hook rejects without invoking", async () => {
+    let calls = 0;
+    class Target extends RpcTarget {
+      run(callback: () => void) { calls++; callback(); }
+    }
+    await using harness = new TestHarness(new Target(), {
+      onCall: async () => { await Promise.resolve(); throw new Error("denied"); },
+    });
+    {
+      using pending = harness.stub.run(() => {});
+      await expect(pending).rejects.toThrow("denied");
+    }
+    await pumpMicrotasks();
+    expect(calls).toBe(0);
+    harness.checkAllDisposed();
+  });
+
+  it("releases a result when the hook rejects after invocation", async () => {
+    let disposed = 0;
+    class Result extends RpcTarget { [Symbol.dispose]() { disposed++; } }
+    class Target extends RpcTarget { getResult() { return new Result(); } }
+    await using harness = new TestHarness(new Target(), {
+      onCall: async (_info, invoke) => { await invoke(); throw new Error("tracing failed"); },
+    });
+    {
+      using pending = harness.stub.getResult();
+      await expect(pending).rejects.toThrow("tracing failed");
+    }
+    await pumpMicrotasks();
+    expect(disposed).toBe(1);
+  });
+
+  it("rejects repeated invocation without running the application twice", async () => {
+    let calls = 0;
+    class Target extends RpcTarget { run() { return ++calls; } }
+    await using harness = new TestHarness(new Target(), {
+      onCall: (_info, invoke) => { invoke(); return invoke(); },
+    });
+    using pending = harness.stub.run();
+    await expect(pending).rejects.toThrow("only once");
+    expect(calls).toBe(1);
+  });
+
+  it("rejects deferred invocation before it can violate call ordering", async () => {
+    let calls = 0;
+    class Target extends RpcTarget { run() { return ++calls; } }
+    await using harness = new TestHarness(new Target(), {
+      onCall: async (_info, invoke) => { await Promise.resolve(); return invoke(); },
+    });
+    using pending = harness.stub.run();
+    await expect(pending).rejects.toThrow("synchronously");
+    expect(calls).toBe(0);
+  });
+
+  it("rejects a hook that returns something other than the invocation", async () => {
+    class Target extends RpcTarget {
+      get value() { return 7; }
+      run() { return 1; }
+    }
+    await using harness = new TestHarness(new Target(), {
+      onCall: (() => Promise.resolve(2)) as any,
+    });
+    using pending = harness.stub.run();
+    await expect(pending).rejects.toThrow("result of invoke()");
+    // Property reads bypass the hook; the session is still healthy.
+    expect(await harness.stub.value).toBe(7);
+  });
+});
+
 describe("promise pipelining", () => {
   it("supports passing a promise in arguments", async () => {
     await using harness = new TestHarness(new TestTarget());

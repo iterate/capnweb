@@ -252,3 +252,20 @@ describe("FlowController", () => {
     expect(sim.fc.window).toStrictEqual(64 * 1024);
   });
 });
+
+describe("coarse clocks", () => {
+  it("keeps backpressure usable when an RTT cannot be measured", () => {
+    let now = 100;
+    const controller = new FlowController(() => now);
+    const first = controller.onSend(40000).token;
+    now = 101;
+    controller.onAck(first);
+    // These sends and their acks land on the same clock tick.
+    const pending = Array.from({ length: 8 }, () => controller.onSend(40000));
+    expect(pending.some(send => send.shouldBlock)).toBe(true);
+    const unblocked = pending.map(({ token }) => controller.onAck(token));
+    expect(unblocked.at(-1)).toBe(true);
+    expect(Number.isFinite(controller.window)).toBe(true);
+    expect(controller.bytesInFlight).toBe(0);
+  });
+});
