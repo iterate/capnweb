@@ -16,11 +16,12 @@ if(COMMAND idf_component_register)
     SRCS ${CAPNWEB_SOURCES}
     INCLUDE_DIRS include)
   target_compile_features(${COMPONENT_LIB} PUBLIC c_std_99)
+  # No -Wpedantic in a component build: ESP-IDF 6's libc headers use
+  # #include_next, a GCC extension. The host build below keeps it.
   target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wall
     -Wextra
-    -Werror
-    -Wpedantic)
+    -Werror)
   return()
 endif()
 
